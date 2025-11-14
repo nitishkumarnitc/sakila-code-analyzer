@@ -1,0 +1,26 @@
+# Ignore everything not needed for the Docker build
+.git
+.gitignore
+.vscode
+.idea
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local virtual environments
+.venv
+env
+venv
+
+# Environment and output files
+
+outputs/
+chromadb_data/
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+
+.qdrant_storage/
+workspaces/
