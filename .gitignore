@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+
+# Docker
+*.pid
+*.log
+outputs/
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+qdrant_storage
+workspaces
