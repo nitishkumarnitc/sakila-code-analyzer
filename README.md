@@ -331,9 +331,7 @@ Everything works identically on any system.
 ---
 
 # 🙌 **Credits**
-
-Developed as part of a coding challenge for **PeerIslands**.
-Includes Sakila Sample Database (open source).
-
+Developed as part of a coding challenge.
+Includes Sakila Sample Project (open source).
 ---
 
