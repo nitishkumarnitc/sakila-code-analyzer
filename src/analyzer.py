@@ -10,7 +10,7 @@ from datetime import datetime
 # local modules (must exist in src/)
 from downloader import clone_or_update
 from ingest import load_codebase
-import vectorstore_qdrant as vs  # expects client, embed_texts, ensure_collection
+import vectorstore as vs  # expects client, embed_texts, ensure_collection
 
 # OpenAI compatibility imports
 import openai

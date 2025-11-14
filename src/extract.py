@@ -1,6 +1,6 @@
-# src/extract_langchain.py
+# src/extract.py
 import os, openai, json
-from vectorstore_qdrant import client as qclient
+from vectorstore import client as qclient
 from typing import List, Dict
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
