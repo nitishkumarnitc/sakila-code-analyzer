@@ -1,5 +1,5 @@
-langchain>=0.0.***  # adapt to your installed version; or pin tested version
-openai>=1.0.0
+langchain
+openai
 qdrant-client
 tiktoken
 pydantic
@@ -7,3 +7,6 @@ gitpython
 python-dotenv
 fastapi  # if you later want an API
 uvicorn
+langchain-openai
+langchain_core
+lizard
