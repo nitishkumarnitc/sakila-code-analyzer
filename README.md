@@ -231,14 +231,13 @@ Produces a valid JSON stub instantly.
 ---
 
 # 📁  Example (.env file)
+```bash
 OPENAI_API_KEY=
 OPENAI_CHAT_MODEL=gpt-4o-mini
 LANGCHAIN_EMBEDDING_MODEL=text-embedding-3-small
-
 # Qdrant
 QDRANT_URL=http://qdrant:6333
 QDRANT_API_KEY=
-
 # Directories
 WORKSPACE_DIR=/app/workspaces
 OUTPUT_DIR=/app/outputs
@@ -262,6 +261,7 @@ EMBED_CACHE_DIR=/tmp/embed_cache
 
 # Post-run validation
 VALIDATE_REPORT=1
+```
 
 # 🧪 Upcoming Enhancements
 
@@ -276,6 +276,7 @@ VALIDATE_REPORT=1
 # 🙌 Credits
 
 Developed as part of a engineering challenge.
+
 Uses:
 
 * **OpenAI embeddings + chat models**
