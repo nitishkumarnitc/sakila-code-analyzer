@@ -9,3 +9,4 @@ fastapi  # if you later want an API
 uvicorn
 langchain-openai
 langchain_core
+lizard
