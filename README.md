@@ -1,139 +1,130 @@
-# 📘 **Sakila Codebase Analyzer (LLM-Powered)**
+# 📘 **Sakila Codebase Analyzer (LLM-Powered, Production-Grade)**
 
-A fully containerized, end-to-end solution to **analyze any GitHub codebase** using **Large Language Models (LLMs)**, **vector embeddings**, and **Qdrant vector database**.
-This project was built as part of a coding assignment for **PeerIslands**, focusing on:
+A fully containerized, scalable system that analyzes **any GitHub codebase** using:
 
-* Automated codebase ingestion
-* Efficient chunking of large source trees
-* Embedding with OpenAI
-* Semantic search using Qdrant
-* LLM-based summarization
-* Structured JSON output
+* **Parallel file chunking**
+* **OpenAI embeddings with caching**
+* **Qdrant vector database**
+* **Semantic retrieval**
+* **Robust LangChain-based LLM summarization**
+* **Structured JSON output with optional validation**
 
----
-
-## ⭐ **High-Level Architecture**
-
-```
-GitHub Repo → Clone/Update → File Loader → Chunker 
- → Embeddings → Qdrant → Semantic Retrieval → LLM Summary 
- → structured JSON output
-```
-
-### **Key Components**
-
-| Component               | Responsibility                                                             |
-| ----------------------- | -------------------------------------------------------------------------- |
-| `downloader.py`         | Git clone / pull logic                                                     |
-| `ingest.py`             | Recursively scan project & load text-based files                           |
-| `analyzer.py`           | Main orchestration: chunking, embedding, upserting, retrieval, LLM summary |
-| `vectorstore_qdrant.py` | Qdrant client + collection management + embedding batch logic              |
-| `cli.py`                | Command-line interface                                                     |
-| `extract.py`            | JSON schema + final structured output formatting                           |
-| `Dockerfile`            | Python runtime with OpenAI + Qdrant client                                 |
-| `docker-compose.yml`    | Multi-container setup (App + Qdrant)                                       |
+This system was built for a **technical coding assignment for PeerIslands**, but the framework is general-purpose and can analyze any repository at scale.
 
 ---
 
-# 🧠 **Approach and Methodology**
-
-## 1️⃣ Repository Acquisition
-
-The system accepts a GitHub URL:
+# 🚀 High-Level Architecture
 
 ```
---repo https://github.com/janjakovacevic/SakilaProject.git
-```
-
-`downloader.py` handles:
-
-* First-time clone
-* Incremental updates (git pull)
-* Workspace isolation (`/app/workspaces/...`)
-
----
-
-## 2️⃣ Codebase Processing
-
-`ingest.py` scans for meaningful text-based files:
-
-* `.java`, `.md`, `.py`, `.sql`, `.xml`, `.json`, `.yaml`, `.html`, etc.
-
-It stores each file as:
-
-```json
-{
-  "path": "...",
-  "content": "string"
-}
+GitHub Repo → Clone/Update → File Loader → Parallel Chunker
+ → Embedding Cache → Batched Embedding → Qdrant Upsert (Thread-Safe)
+ → Semantic Retrieval → LLM Summary → Validated JSON Output
 ```
 
 ---
 
-## 3️⃣ Chunking Logic (Token-Limit Friendly)
+# 🧩 Components Overview
 
-Large files are split into overlapping chunks using a **robust, infinite-loop–safe** algorithm:
-
-```text
-chunk_size = 1000 chars  
-overlap     = 200 chars
-```
-
-This ensures:
-
-* No chunk exceeds model token limits
-* Semantic continuity between chunks
-* No infinite loop on end boundary
-
----
-
-## 4️⃣ Vector Embeddings (OpenAI)
-
-Each chunk is embedded using:
-
-```
-text-embedding-3-large (1536-dim)
-```
-
-Embedding batching parameters (tunable):
-
-* `QDRANT_EMBED_BATCH=4`
-* `UPSERT_BATCH=32`
+| Component            | Responsibility                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `config.py`          | Loads & validates all environment-based configuration in one place                                                  |
+| `downloader.py`      | Clones/pulls the target GitHub repository                                                                           |
+| `ingest.py`          | Walks the repo file tree and loads allowed text-based files                                                         |
+| `analyzer.py`        | Main orchestration: static analysis, parallel chunking, embedding, upsert, retrieval, LLM summarization, validation |
+| `vectorstore.py`     | Qdrant client wrapper (collection management + safe upserts)                                                        |
+| `extract.py`         | Smaller utility for producing structured JSON summaries                                                             |
+| `validate_report.py` | Optional validation layer to annotate/verify final output                                                           |
+| `cli.py`             | Command-line interface runner                                                                                       |
+| `docker-compose.yml` | App + Qdrant as isolated microservices                                                                              |
+| `Dockerfile`         | Application runtime with required libraries                                                                         |
 
 ---
 
-## 5️⃣ Vector Storage (Qdrant)
+# ⚙️ Key Features
 
-Qdrant stores embedded chunks with metadata:
+## 🔹 **1. Centralized Configuration**
 
-```json
-{
-  "path": "file.java",
-  "chunk_index": 12,
-  "text": "actual code text..."
-}
+All environment variables (OpenAI models, chunk sizes, workers, cache dirs) are imported via `config.py`.
+
+Supports `.env`, `docker-compose`, or environment export.
+
+---
+
+## 🔹 **2. Parallel Chunking Engine**
+
+Each file is split into overlapping chunks using configurable settings:
+
+```
+CHUNK_SIZE=1200
+CHUNK_OVERLAP=240
+CHUNKER_WORKERS=4+
 ```
 
-Collections are versioned per repository:
+Parallelism drastically speeds up large codebase processing.
+
+---
+
+## 🔹 **3. Embedding Cache (SHA256-based)**
+
+To minimize OpenAI usage and speed up re-runs:
+
+* Each chunk is hashed
+* Embeddings are cached under `EMBED_CACHE_DIR`
+* Atomic writes protect cache from corruption
+* Cache is reused on future runs
+
+---
+
+## 🔹 **4. Thread-Safe Embedding + Qdrant Upsert**
+
+Embedding and upserting happen in parallel:
+
+* `UPSERTER_WORKERS` controls concurrency
+* `UPSERT_BATCH` controls batch size
+* `_qdrant_lock` ensures thread-safe Qdrant upserts
+
+---
+
+## 🔹 **5. Robust LangChain Chat Invocation**
+
+LangChain changes APIs often.
+
+This project includes a **multi-strategy failover**:
+
+```python
+chat.generate → chat.predict_messages → chat.predict → chat() call
+```
+
+This prevents version-related crashes like:
 
 ```
-repo_sakilaproject
-repo_mynewrepo
+TypeError: 'ChatOpenAI' is not callable
 ```
 
 ---
 
-## 6️⃣ Semantic Retrieval
+## 🔹 **6. Static Analysis (Lightweight but Useful)**
 
-The system queries Qdrant using a natural-language prompt:
+The analyzer extracts:
+
+* Approx function signatures
+* Cyclomatic complexity estimates
+* LOC metrics
+* Small contextual snippets
+
+This helps the LLM produce **lead-level architectural analysis**.
+
+---
+
+## 🔹 **7. Top-K Semantic Retrieval via Qdrant**
+
+Retrieval prompt example:
 
 ```
-"Provide high-level summary and key methods"
+Provide high-level summary, architecture, key modules, and risks
 ```
 
-Top-K most relevant chunks are retrieved.
-
-Example default:
+Default:
 
 ```
 TOP_K = 8
@@ -141,86 +132,39 @@ TOP_K = 8
 
 ---
 
-## 7️⃣ LLM Summarization (OpenAI GPT-4o/5)
+## 🔹 **8. Lead-Level Structured JSON Output**
 
-The retrieved chunks are given to an LLM to generate structured insights:
+The LLM is forced (via schema prompt) to produce:
 
 * Project overview
-* Technologies used
-* Key classes
-* Important methods
-* Method signatures
-* Complexity notes
-* Assumptions
+* Architecture summary
+* Key modules + methods (LOC, cyclomatic complexity, source_ref)
+* Dependencies
+* Tests & CI presence
+* Global risks & recommendations
+* ISO timestamp
 
----
-
-## 8️⃣ Structured JSON Output
-
-Results are written to:
+Crypto-stable JSON is saved:
 
 ```
-outputs/<RepoName>/extracted_knowledge.json
-```
-
-Example structure:
-
-```json
-{
-  "project_name": "...",
-  "project_overview": "...",
-  "key_modules": [...],
-  "generated_at": "timestamp"
-}
+outputs/<repo>/extracted_knowledge.json
 ```
 
 ---
 
-# 🐳 **Docker Setup**
+## 🔹 **9. Optional Validation Step**
 
-This project is fully containerized:
-
-## **Services**
-
-### **1. App Container**
-
-* Python 3.10
-* OpenAI client
-* Qdrant client
-* LangChain-lite integration
-* All repo code mounted inside `/app/src`
-
-### **2. Qdrant Vector Database**
-
-Vector similarity search engine.
-
-Expose:
+If enabled (`VALIDATE_AFTER=1`), a validated version is also created:
 
 ```
-localhost:6333
+outputs/<repo>/extracted_knowledge_validated.json
 ```
 
 ---
 
-# ▶️ **How to Run**
+# 🐳 Dockerized Execution
 
-## 0. Prerequisite: Set OpenAI API Key
-
-You may place it inside `.env`:
-
-```
-OPENAI_API_KEY=your_key_here
-```
-
-Or export it:
-
-```bash
-export OPENAI_API_KEY="your_key_here"
-```
-
----
-
-## 1. Start Qdrant (if not already running)
+## ✔ Start Qdrant
 
 ```bash
 docker compose up -d qdrant
@@ -228,112 +172,118 @@ docker compose up -d qdrant
 
 ---
 
-## 2. Run the Analyzer (Full Production Run)
+## ✔ Full Production Run
 
 ```bash
 docker compose run --rm \
-  -e DRY_RUN=0 \
-  -e SKIP_CHAT=0 \
-  -e MAX_FILES=0 \
-  -e CHUNK_SIZE=1000 \
-  -e CHUNK_OVERLAP=200 \
-  -e QDRANT_EMBED_BATCH=4 \
-  -e UPSERT_BATCH=32 \
   -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
   app python -u src/cli.py \
     --repo https://github.com/janjakovacevic/SakilaProject.git \
     --name SakilaProject
 ```
 
----
+This performs:
 
-## 3. Output Location
-
-After successful run:
-
-```
-outputs/SakilaProject/extracted_knowledge.json
-```
-
-Open it:
-
-```bash
-cat outputs/SakilaProject/extracted_knowledge.json | jq .
-```
+* Chunking
+* Embedding (cached where possible)
+* Upsert
+* Retrieval
+* LLM summarization
+* Final JSON generation
+* Optional validation
 
 ---
 
-# 🛠️ **Development Mode (Dry Run)**
-
-Useful during debugging:
+## ✔ Development / Fast Mode (No API Calls)
 
 ```bash
-docker compose run --rm --no-deps \
+docker compose run --rm \
   -e DRY_RUN=1 \
   -e SKIP_CHAT=1 \
-  -e MAX_FILES=10 \
-  -e CHUNK_SIZE=200 \
-  -e CHUNK_OVERLAP=50 \
+  -e MAX_FILES=20 \
   app python -u src/cli.py \
     --repo https://github.com/janjakovacevic/SakilaProject.git \
     --name TestRun
 ```
 
-No OpenAI calls.
-No real embeddings.
-No LLM summary.
-Fast & memory-safe.
+Produces a valid JSON stub instantly.
 
 ---
 
-# 📚 **Libraries Used**
+# 📁 Output Example (Schema)
 
-| Library                      | Purpose                             |
-| ---------------------------- | ----------------------------------- |
-| **OpenAI Python SDK**        | Embeddings + chat LLM summarization |
-| **Qdrant Client**            | Vector storage and semantic search  |
-| **GitPython / subprocess**   | Repo cloning & updating             |
-| **Pydantic**                 | Output schema validation            |
-| **tqdm**                     | Progress loops                      |
-| **LangChain-lite utilities** | Text handling & similarity helpers  |
-| **Docker + Docker Compose**  | Full reproducible environment       |
-
----
-
-# 🚀 **Why This Approach?**
-
-### ✔ Handles Large Codebases
-
-Chunking + embeddings + vector storage allow processing >1000 files.
-
-### ✔ Scalable
-
-Qdrant + OpenAI = fast & distributed.
-
-### ✔ Deterministic JSON Output
-
-Stable schema for automation or dashboards.
-
-### ✔ Containerized & Repeatable
-
-Everything works identically on any system.
+```json
+{
+  "project_name": "SakilaProject",
+  "project_overview": "...",
+  "architecture_summary": "...",
+  "primary_languages": ["Java"],
+  "dependencies": [...],
+  "key_modules": [...],
+  "tests_and_ci": {...},
+  "global_complexity_notes": "...",
+  "recommendations": [...],
+  "generated_at": "2025-01-31T10:22:33Z",
+  "assumptions": [...]
+}
+```
 
 ---
 
-# 🎯 **Future Improvements**
+# 📁  Example (.env file)
+OPENAI_API_KEY=
+OPENAI_CHAT_MODEL=gpt-4o-mini
+LANGCHAIN_EMBEDDING_MODEL=text-embedding-3-small
 
-* Token-level chunking (better for transformer models)
-* Language-specific parsers (Java AST extraction)
-* UI dashboard for visualizing code insights
-* Model streaming for faster summarization
-* Multi-repo batch analysis
+# Qdrant
+QDRANT_URL=http://qdrant:6333
+QDRANT_API_KEY=
+
+# Directories
+WORKSPACE_DIR=/app/workspaces
+OUTPUT_DIR=/app/outputs
+
+# Retrieval
+TOP_K=8
+
+# Chunking
+CHUNK_SIZE=1500
+CHUNK_OVERLAP=270
+
+# Batching & Parallelism
+UPSERT_BATCH=128
+EMBED_BATCH=64
+EMBED_CONCURRENCY=6
+UPSERTER_WORKERS=6
+CHUNKER_WORKERS=6
+
+# Embed cache
+EMBED_CACHE_DIR=/tmp/embed_cache
+
+# Post-run validation
+VALIDATE_REPORT=1
+
+# 🧪 Upcoming Enhancements
+
+* Token-aware chunking (`tiktoken`-based)
+* Java/Python/TS AST-based parsing for deeper static analysis
+* Incremental re-analysis (only changed files)
+* A small UI dashboard for insights
+* Model streaming for low-latency summarization
 
 ---
 
-# 🙌 **Credits**
+# 🙌 Credits
 
-Developed as part of a coding challenge for **PeerIslands**.
-Includes Sakila Sample Database (open source).
+Developed as part of a engineering challenge.
+Uses:
+
+* **OpenAI embeddings + chat models**
+* **Qdrant vector database**
+* **LangChain for LLM orchestration**
+* **Docker for reproducibility**
 
 ---
+
+
 
