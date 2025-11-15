@@ -27,7 +27,7 @@ GitHub Repo → Clone/Update → File Loader → Chunker
 | `downloader.py`         | Git clone / pull logic                                                     |
 | `ingest.py`             | Recursively scan project & load text-based files                           |
 | `analyzer.py`           | Main orchestration: chunking, embedding, upserting, retrieval, LLM summary |
-| `vectorstore_qdrant.py` | Qdrant client + collection management + embedding batch logic              |
+| `vectorstore.py` | Qdrant client + collection management + embedding batch logic              |
 | `cli.py`                | Command-line interface                                                     |
 | `extract.py`            | JSON schema + final structured output formatting                           |
 | `Dockerfile`            | Python runtime with OpenAI + Qdrant client                                 |
