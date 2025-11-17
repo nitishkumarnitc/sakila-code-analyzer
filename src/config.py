@@ -1,72 +1,100 @@
 # src/config.py
-"""
-Centralized configuration for the analyzer.
-Reads from environment variables and exposes typed constants.
+"""Simple centralized config — maps environment variables to typed constants.
+Includes aliases to remain compatible with analyzer/vectorstore expectations.
 """
 
 import os
 from pathlib import Path
 from typing import Optional
 
-def _as_bool(v: Optional[str], default: bool = False) -> bool:
+# small helpers
+def _int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, default))
+    except Exception:
+        return default
+
+def _float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, default))
+    except Exception:
+        return default
+
+def _bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
-def _as_int(v: Optional[str], default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
+# ---------------------
+# OpenAI / LangChain
+# ---------------------
+OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+OPENAI_CHAT_MODEL: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_EMBED_MODEL: str = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
-def _as_float(v: Optional[str], default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
 
-# --- Paths ---
-WORKSPACE: str = os.environ.get("WORKSPACE_DIR", "/app/workspaces")
-OUTPUT_DIR: str = os.environ.get("OUTPUT_DIR", "/app/outputs")
+# ---------------------
+# Qdrant
+# ---------------------
+QDRANT_URL: str = os.getenv("QDRANT_URL", "http://qdrant:6333")
+QDRANT_API_KEY: Optional[str] = os.getenv("QDRANT_API_KEY") or None
 
-# --- OpenAI / LangChain model names ---
-OPENAI_CHAT_MODEL: str = os.environ.get("OPENAI_CHAT_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
-LANGCHAIN_EMBEDDING_MODEL: str = os.environ.get("LANGCHAIN_EMBEDDING_MODEL", os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+# ---------------------
+# Directories
+# ---------------------
+WORKSPACE_DIR: str = os.getenv("WORKSPACE_DIR", "/app/workspaces")
+OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "/app/outputs")
 
-# --- Behavior flags ---
-DRY_RUN: bool = _as_bool(os.environ.get("DRY_RUN"), False)
-SKIP_CHAT: bool = _as_bool(os.environ.get("SKIP_CHAT"), False)
-VALIDATE_AFTER: bool = _as_bool(os.environ.get("VALIDATE_REPORT") or os.environ.get("VALIDATE_AFTER"), False)
+# ---------------------
+# Retrieval / chunking
+# ---------------------
+TOP_K: int = _int("TOP_K", 8)
+CHUNK_SIZE: int = _int("CHUNK_SIZE", 1500)
+CHUNK_OVERLAP: int = _int("CHUNK_OVERLAP", 270)
 
-# --- Retrieval ---
-TOP_K: int = _as_int(os.environ.get("TOP_K"), 8)
+# ---------------------
+# Batching / parallelism
+# ---------------------
+UPSERT_BATCH: int = _int("UPSERT_BATCH", 128)
+EMBED_BATCH: int = _int("EMBED_BATCH", 64)
+EMBED_CONCURRENCY: int = _int("EMBED_CONCURRENCY", 6)
+UPSERTER_WORKERS: int = _int("UPSERTER_WORKERS", 6)
+CHUNKER_WORKERS: int = _int("CHUNKER_WORKERS", 6)
 
-# --- Chunking (character-based) ---
-CHUNK_SIZE: int = _as_int(os.environ.get("CHUNK_SIZE"), 1200)
-CHUNK_OVERLAP: int = _as_int(os.environ.get("CHUNK_OVERLAP"), 240)
+# Provide both EMBED_BATCH and QDRANT_EMBED_BATCH aliases used elsewhere
+QDRANT_EMBED_BATCH: int = EMBED_BATCH
 
-# --- Batching / parallelism ---
-UPSERT_BATCH: int = _as_int(os.environ.get("UPSERT_BATCH"), 128)
-EMBED_BATCH: int = _as_int(os.environ.get("EMBED_BATCH"), 64)
-EMBED_CONCURRENCY: int = _as_int(os.environ.get("EMBED_CONCURRENCY"), 4)
-UPSERTER_WORKERS: int = _as_int(os.environ.get("UPSERTER_WORKERS"), EMBED_CONCURRENCY)
-CHUNKER_WORKERS: int = _as_int(os.environ.get("CHUNKER_WORKERS"), max(2, (os.cpu_count() or 2)))
+# ---------------------
+# Embed cache
+# ---------------------
+EMBED_CACHE_DIR: str = os.getenv("EMBED_CACHE_DIR", "/tmp/embed_cache")
 
-# --- Limits ---
-MAX_FILES: int = _as_int(os.environ.get("MAX_FILES"), 0)
+# ---------------------
+# Validation / flags
+# ---------------------
+VALIDATE_REPORT: bool = _bool("VALIDATE_REPORT", True)
+VALIDATE_AFTER: bool = VALIDATE_REPORT   # analyzer compatibility
 
-# --- Embedding cache ---
-EMBED_CACHE_DIR: str = os.environ.get("EMBED_CACHE_DIR", "/tmp/embed_cache")
+DRY_RUN: bool = _bool("DRY_RUN", False)
+SKIP_CHAT: bool = _bool("SKIP_CHAT", False)
+MAX_FILES: int = _int("MAX_FILES", 0)
 
-# --- Retry/backoff params ---
-EMBED_RETRIES: int = _as_int(os.environ.get("EMBED_RETRIES"), 3)
-EMBED_BACKOFF_BASE: float = _as_float(os.environ.get("EMBED_BACKOFF_BASE"), 0.8)
+# ---------------------
+# Retry / backoff
+# ---------------------
+EMBED_RETRIES: int = _int("EMBED_RETRIES", 3)
+EMBED_BACKOFF_BASE: float = _float("EMBED_BACKOFF_BASE", 0.8)
 
-# --- Logging ---
-LOG_LEVEL: str = os.environ.get("ANALYSER_LOG_LEVEL", "INFO")
-HTTPX_LOG_LEVEL: str = os.environ.get("HTTPX_LOG_LEVEL", "WARNING")
+# ---------------------
+# Logging
+# ---------------------
+LOG_LEVEL: str = os.getenv("ANALYSER_LOG_LEVEL", "INFO")
+HTTPX_LOG_LEVEL: str = os.getenv("HTTPX_LOG_LEVEL", "WARNING")
 
-# Ensure directories exist
-Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
+# ---------------------
+# Ensure dirs exist
+# ---------------------
+Path(WORKSPACE_DIR).mkdir(parents=True, exist_ok=True)
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 Path(EMBED_CACHE_DIR).mkdir(parents=True, exist_ok=True)

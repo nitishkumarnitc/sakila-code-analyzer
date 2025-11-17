@@ -20,7 +20,7 @@ logging.basicConfig(level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO))
 
 # config-driven constants
 TOP_K = cfg.TOP_K
-EMBED_MODEL = cfg.LANGCHAIN_EMBEDDING_MODEL
+EMBED_MODEL = cfg.OPENAI_EMBED_MODEL
 CHAT_MODEL = cfg.OPENAI_CHAT_MODEL
 
 # lazy langchain instances

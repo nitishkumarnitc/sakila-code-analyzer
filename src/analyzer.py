@@ -31,29 +31,25 @@ logging.basicConfig(level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO))
 # -----------------------
 # Config (use cfg.*)
 # -----------------------
-WORKSPACE = cfg.WORKSPACE
-TOP_K = cfg.TOP_K
-OUTPUT_DIR = cfg.OUTPUT_DIR
+from config import (
+    WORKSPACE_DIR,
+    TOP_K,
+    OUTPUT_DIR,
+    DRY_RUN,
+    SKIP_CHAT,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    UPSERT_BATCH,
+    EMBED_BATCH,
+    VALIDATE_AFTER,
+    CHUNKER_WORKERS,
+    UPSERTER_WORKERS,
+    MAX_FILES,
+    EMBED_CACHE_DIR,
+    EMBED_RETRIES,
+    EMBED_BACKOFF_BASE,
+)
 
-DRY_RUN = cfg.DRY_RUN
-SKIP_CHAT = cfg.SKIP_CHAT
-
-CHUNK_SIZE = cfg.CHUNK_SIZE
-CHUNK_OVERLAP = cfg.CHUNK_OVERLAP
-
-UPSERT_BATCH = cfg.UPSERT_BATCH
-EMBED_BATCH = cfg.EMBED_BATCH
-VALIDATE_AFTER = cfg.VALIDATE_AFTER
-
-EMBED_CONCURRENCY = cfg.EMBED_CONCURRENCY
-CHUNKER_WORKERS = cfg.CHUNKER_WORKERS
-UPSERTER_WORKERS = cfg.UPSERTER_WORKERS
-
-MAX_FILES = cfg.MAX_FILES
-CACHE_DIR = cfg.EMBED_CACHE_DIR
-
-EMBED_RETRIES = cfg.EMBED_RETRIES
-EMBED_BACKOFF_BASE = cfg.EMBED_BACKOFF_BASE
 
 # LangChain lazy instances
 _lc_embeddings: Optional[OpenAIEmbeddings] = None
@@ -70,7 +66,7 @@ def _get_langchain_embeddings() -> OpenAIEmbeddings:
     global _lc_embeddings
     if _lc_embeddings is not None:
         return _lc_embeddings
-    model_name = cfg.LANGCHAIN_EMBEDDING_MODEL
+    model_name = cfg.OPENAI_EMBED_MODEL
     _lc_embeddings = OpenAIEmbeddings(model=model_name, chunk_size=EMBED_BATCH)
     return _lc_embeddings
 
@@ -92,7 +88,7 @@ def _chunk_hash(text: str) -> str:
 
 
 def _cache_path_for_hash(h: str) -> str:
-    return os.path.join(CACHE_DIR, f"{h}.json")
+    return os.path.join(EMBED_CACHE_DIR, f"{h}.json")
 
 
 def load_vector_from_cache(h: str):
@@ -409,7 +405,7 @@ RETRIEVED CONTEXTS:
 # Orchestration
 # -----------------------
 def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
-    repo_path = clone_or_update(git_url, WORKSPACE, repo_name)
+    repo_path = clone_or_update(git_url, WORKSPACE_DIR, repo_name)
     repo_basename = Path(repo_path).name
     collection = f"repo_{repo_basename.lower()}"
 
