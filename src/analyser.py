@@ -1,95 +1,92 @@
 # src/analyser.py
+"""
+Analyzer for Sakila - prioritizes controllers, services, repositories, entities, securingweb.
+Produces grouped_modules in the final JSON for easier review.
+
+Usage:
+    python src/analyser.py --repo <git_url> [--name <repo_name>]
+"""
+from __future__ import annotations
+
 import os
+import re
 import json
 import uuid
 import time
-import re
+import math
 import logging
 import hashlib
 import threading
-from typing import List, Dict, Optional
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Any
 
 from downloader import clone_or_update
 from ingest import load_codebase
-import vectorstore as vs  # expects vs.client, vs.ensure_collection
+import vectorstore as vs
 
-# LangChain (langchain-openai + langchain-core)
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Central config
 import config as cfg
 
-# Configure logging
-logging.getLogger("httpx").setLevel(getattr(logging, cfg.HTTPX_LOG_LEVEL.upper(), logging.WARNING))
+# Optional tiktoken
+try:
+    import tiktoken  # type: ignore
+    _TIKTOKEN_AVAILABLE = True
+except Exception:
+    _TIKTOKEN_AVAILABLE = False
+
 logger = logging.getLogger("analyser")
-logging.basicConfig(level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO))
+logging.basicConfig(level=getattr(cfg, "LOG_LEVEL", "INFO").upper())
 
-# -----------------------
-# Config (use cfg.*)
-# -----------------------
-from config import (
-    WORKSPACE_DIR,
-    TOP_K,
-    OUTPUT_DIR,
-    DRY_RUN,
-    SKIP_CHAT,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
-    UPSERT_BATCH,
-    EMBED_BATCH,
-    VALIDATE_AFTER,
-    CHUNKER_WORKERS,
-    UPSERTER_WORKERS,
-    MAX_FILES,
-    EMBED_CACHE_DIR,
-    EMBED_RETRIES,
-    EMBED_BACKOFF_BASE,
-)
+# Config
+WORKSPACE_DIR = getattr(cfg, "WORKSPACE_DIR", "/tmp/workspace")
+TOP_K = getattr(cfg, "TOP_K", 8)
+OUTPUT_DIR = getattr(cfg, "OUTPUT_DIR", "out")
+DRY_RUN = getattr(cfg, "DRY_RUN", True)
+SKIP_CHAT = getattr(cfg, "SKIP_CHAT", True)
+CHUNK_SIZE = getattr(cfg, "CHUNK_SIZE", 2400)
+CHUNK_OVERLAP = getattr(cfg, "CHUNK_OVERLAP", 200)
+UPSERT_BATCH = getattr(cfg, "UPSERT_BATCH", 16)
+EMBED_BATCH = getattr(cfg, "EMBED_BATCH", 16)
+VALIDATE_AFTER = getattr(cfg, "VALIDATE_AFTER", False)
+CHUNKER_WORKERS = getattr(cfg, "CHUNKER_WORKERS", 4)
+UPSERTER_WORKERS = getattr(cfg, "UPSERTER_WORKERS", 4)
+MAX_FILES = getattr(cfg, "MAX_FILES", -1)
+EMBED_CACHE_DIR = getattr(cfg, "EMBED_CACHE_DIR", ".embed_cache")
+EMBED_RETRIES = getattr(cfg, "EMBED_RETRIES", 3)
+EMBED_BACKOFF_BASE = getattr(cfg, "EMBED_BACKOFF_BASE", 0.5)
+OPENAI_EMBED_MODEL = getattr(cfg, "OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_CHAT_MODEL = getattr(cfg, "OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
+os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
 
-# LangChain lazy instances
 _lc_embeddings: Optional[OpenAIEmbeddings] = None
 _lc_chat: Optional[ChatOpenAI] = None
-
-# Qdrant upsert lock (some clients require safety)
 _qdrant_lock = threading.Lock()
 
-
-# -----------------------
-# LangChain helpers
-# -----------------------
 def _get_langchain_embeddings() -> OpenAIEmbeddings:
     global _lc_embeddings
     if _lc_embeddings is not None:
         return _lc_embeddings
-    model_name = cfg.OPENAI_EMBED_MODEL
-    _lc_embeddings = OpenAIEmbeddings(model=model_name, chunk_size=EMBED_BATCH)
+    _lc_embeddings = OpenAIEmbeddings(model=OPENAI_EMBED_MODEL, chunk_size=EMBED_BATCH)
     return _lc_embeddings
-
 
 def _get_langchain_chat() -> ChatOpenAI:
     global _lc_chat
     if _lc_chat is not None:
         return _lc_chat
-    model = cfg.OPENAI_CHAT_MODEL
-    _lc_chat = ChatOpenAI(model_name=model, temperature=0)
+    _lc_chat = ChatOpenAI(model_name=OPENAI_CHAT_MODEL, temperature=0)
     return _lc_chat
 
-
-# -----------------------
-# Embedding cache helpers
-# -----------------------
+# ---------- embedding cache ----------
 def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-
 def _cache_path_for_hash(h: str) -> str:
     return os.path.join(EMBED_CACHE_DIR, f"{h}.json")
-
 
 def load_vector_from_cache(h: str):
     p = _cache_path_for_hash(h)
@@ -98,14 +95,12 @@ def load_vector_from_cache(h: str):
     try:
         with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        logger.debug("Cache read failed for %s: %s — removing corrupted cache", p, e)
+    except Exception:
         try:
             os.remove(p)
         except Exception:
             pass
         return None
-
 
 def save_vector_to_cache(h: str, vec):
     p = _cache_path_for_hash(h)
@@ -114,39 +109,109 @@ def save_vector_to_cache(h: str, vec):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(vec, f)
         os.replace(tmp, p)
-    except Exception as e:
-        logger.debug("Failed to persist cache %s: %s", p, e)
+    except Exception:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
 
+# ---------- token estimation & chunking ----------
+def estimate_tokens(text: str, model: str = OPENAI_CHAT_MODEL) -> int:
+    if not text:
+        return 0
+    if _TIKTOKEN_AVAILABLE:
+        try:
+            enc = tiktoken.encoding_for_model(model)
+        except Exception:
+            enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    return max(1, math.ceil(len(text) / 4))
 
-# -----------------------
-# Static analysis helpers (lightweight)
-# -----------------------
+def chunk_text_token_aware(text: str, token_target: int = 1500, model: str = OPENAI_CHAT_MODEL) -> List[str]:
+    if not text:
+        return []
+    if estimate_tokens(text, model) <= token_target:
+        return [text]
+    boundary_re = re.compile(r"(^\s*(public|private|protected|static|final|def|class|function)\b.*$)|(\n\s*\n)", flags=re.MULTILINE)
+    indices = [0]
+    for m in boundary_re.finditer(text):
+        idx = m.start()
+        if idx > indices[-1]:
+            indices.append(idx)
+    indices.append(len(text))
+    parts = []
+    for a, b in zip(indices, indices[1:]):
+        p = text[a:b].strip()
+        if p:
+            parts.append(p)
+    final = []
+    for p in parts:
+        if estimate_tokens(p, model) <= token_target:
+            final.append(p)
+            continue
+        paras = re.split(r"\n\s*\n", p)
+        buf = ""
+        for para in paras:
+            if not para.strip():
+                continue
+            if not buf:
+                buf = para
+            elif estimate_tokens(buf + "\n\n" + para, model) <= token_target:
+                buf = buf + "\n\n" + para
+            else:
+                final.append(buf)
+                buf = para
+        if buf:
+            if estimate_tokens(buf, model) <= token_target:
+                final.append(buf)
+            else:
+                chars_per_chunk = max(1000, int(len(buf) * token_target / max(1, estimate_tokens(buf, model))))
+                for i in range(0, len(buf), chars_per_chunk):
+                    final.append(buf[i:i+chars_per_chunk])
+    if not final:
+        chars_per = max(1000, token_target * 4)
+        for i in range(0, len(text), chars_per):
+            final.append(text[i:i+chars_per])
+    return final
+
+def chunk_text_simple(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    if not text:
+        return []
+    text = text.strip()
+    L = len(text)
+    if L <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < L:
+        end = min(start + chunk_size, L)
+        chunks.append(text[start:end])
+        if end == L:
+            break
+        next_start = end - overlap
+        start = end if next_start <= start else next_start
+    return chunks
+
+# ---------- static analysis ----------
 FUNC_REGEX = {
-    "python": re.compile(r'(?m)^\s*def\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*:'),
     "java": re.compile(r'(?m)^\s*(public|private|protected|static|\s)*\s*[\w\<\>\[\]]+\s+([a-zA-Z0-9_]+)\s*\(([^\)]*)\)\s*\{'),
+    "python": re.compile(r'(?m)^\s*def\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*:'),
     "js": re.compile(r'(?m)^\s*(?:function\s+)?([A-Za-z0-9_]+)\s*\(([^\)]*)\)\s*\{'),
 }
 
-
 def detect_language(path: str) -> str:
     ext = Path(path).suffix.lower()
-    if ext == ".py":
-        return "python"
     if ext in {".java", ".kt"}:
         return "java"
+    if ext == ".py":
+        return "python"
     if ext in {".js", ".ts"}:
         return "js"
     return "other"
 
-
 def line_of_index(text: str, idx: int) -> int:
     return text.count("\n", 0, idx) + 1
-
 
 def estimate_cyclomatic(snippet: str) -> int:
     tokens = [" if ", " for ", " while ", " case ", "&&", "||", "elif ", "else if", "catch "]
@@ -156,32 +221,26 @@ def estimate_cyclomatic(snippet: str) -> int:
         count += s.count(t)
     return max(1, count)
 
-
-def find_functions(text: str, lang: str) -> List[Dict]:
+def find_functions(text: str, lang: str) -> List[Dict[str, Any]]:
     patt = FUNC_REGEX.get(lang)
     if not patt:
         return []
     funcs = []
     for m in patt.finditer(text):
-        name = m.group(2) if lang == "java" else m.group(1)
+        if lang == "java":
+            name = m.group(2)
+        else:
+            name = m.group(1)
         sig = m.group(0).strip()
         start_idx = m.start()
         start_line = line_of_index(text, start_idx)
-        snippet = text[m.start(): m.start() + 3000]
+        snippet = text[m.start(): m.start() + 4000]
         loc = snippet.count("\n") + 1
         cc = estimate_cyclomatic(snippet)
-        funcs.append({
-            "name": name,
-            "signature": sig,
-            "start_line": start_line,
-            "loc": loc,
-            "cyclomatic": cc,
-            "snippet": snippet[:1500]
-        })
+        funcs.append({"name": name, "signature": sig, "start_line": start_line, "loc": loc, "cyclomatic": cc, "snippet": snippet[:2000]})
     return funcs
 
-
-def analyze_code_docs(docs: List[Dict]) -> List[Dict]:
+def analyze_code_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     modules = []
     for doc in docs:
         path = doc.get("path", "<unknown>")
@@ -204,36 +263,17 @@ def analyze_code_docs(docs: List[Dict]) -> List[Dict]:
         })
     return modules
 
-
-# -----------------------
-# Chunking + embedding + upsert helpers (parallel)
-# -----------------------
-def chunk_text_simple(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    if not text:
-        return []
-    text = text.strip()
-    L = len(text)
-    if L <= chunk_size:
-        return [text]
-    chunks = []
-    start = 0
-    while start < L:
-        end = min(start + chunk_size, L)
-        chunks.append(text[start:end])
-        if end == L:
-            break
-        next_start = end - overlap
-        start = end if next_start <= start else next_start
-    return chunks
-
-
-def process_file_to_chunks(doc: Dict) -> List[Dict]:
+# ---------- chunking & embedding ----------
+def process_file_to_chunks(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     path = doc.get("path", "<unknown>")
     text = doc.get("content", "") or ""
-    chks = chunk_text_simple(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
-    file_docs = [{"path": path, "chunk_index": i, "text": c} for i, c in enumerate(chks)]
-    return file_docs
-
+    try:
+        chks = chunk_text_token_aware(text, token_target=1500)
+        if not chks:
+            chks = chunk_text_simple(text)
+    except Exception:
+        chks = chunk_text_simple(text)
+    return [{"path": path, "chunk_index": i, "text": c} for i, c in enumerate(chks)]
 
 def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
     emb = _get_langchain_embeddings()
@@ -248,10 +288,8 @@ def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
         else:
             to_fetch.append(t)
             indices.append(i)
-
     if not to_fetch:
         return vectors
-
     attempt = 0
     last_exc = None
     while attempt <= EMBED_RETRIES:
@@ -265,14 +303,12 @@ def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
         except Exception as e:
             last_exc = e
             sleep_t = EMBED_BACKOFF_BASE * (2 ** attempt)
-            logger.warning("Embedding failed (attempt %d/%d): %s — sleeping %.2fs", attempt + 1, EMBED_RETRIES + 1, e, sleep_t)
+            logger.warning("Embedding failed (attempt %d): %s — sleeping %.2fs", attempt + 1, e, sleep_t)
             time.sleep(sleep_t)
             attempt += 1
-
     raise RuntimeError("Embedding failed after retries") from last_exc
 
-
-def embed_and_upsert_batch(collection: str, batch: List[Dict], dry_run: bool = DRY_RUN) -> int:
+def embed_and_upsert_batch(collection: str, batch: List[Dict[str, Any]], dry_run: bool = DRY_RUN) -> int:
     if not batch:
         return 0
     texts = [d["text"] for d in batch]
@@ -280,39 +316,25 @@ def embed_and_upsert_batch(collection: str, batch: List[Dict], dry_run: bool = D
         vectors = [[0.0] for _ in texts]
     else:
         vectors = _embed_texts_with_retry(texts)
-
     points = []
     for j, d in enumerate(batch):
         payload = {"path": d["path"], "chunk_index": d["chunk_index"], "text": d["text"]}
         points.append({"id": str(uuid.uuid4()), "vector": vectors[j], "payload": payload})
-
     with _qdrant_lock:
         vs.upsert(collection_name=collection, points=points)
     return len(points)
 
-
-# -----------------------
-# Retrieval & Chat helpers
-# -----------------------
-def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> List[Dict]:
+# ---------- retrieval & chat ----------
+def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if DRY_RUN:
         return [{"path": "<dry-run>", "chunk_index": 0, "document": "dry-run context snippet"}]
-
     q_emb = vs.embed_texts([query])[0]
     raw = vs.search(collection_name=collection, query_vector=q_emb, limit=k, with_payload=True)
-    # raw is list of {"payload": {...}, "score": ...}
     contexts = []
     for h in raw:
         payload = h.get("payload", {}) or {}
-        contexts.append({
-            "path": payload.get("path", ""),
-            "chunk_index": payload.get("chunk_index"),
-            "document": payload.get("text", "")
-        })
-
+        contexts.append({"path": payload.get("path", ""), "chunk_index": payload.get("chunk_index"), "document": payload.get("text", "")})
     return contexts
-
-
 
 def call_chat_robust(system: SystemMessage, user: HumanMessage) -> str:
     chat = _get_langchain_chat()
@@ -324,39 +346,26 @@ def call_chat_robust(system: SystemMessage, user: HumanMessage) -> str:
         if getattr(gen, "text", None) is not None:
             return gen.text
         return str(gen)
-    except Exception as e:
-        logger.debug("chat.generate failed: %s", e)
+    except Exception:
+        pass
+    for method in ("predict_messages", "predict", "__call__"):
+        try:
+            func = getattr(chat, method, None)
+            if not func:
+                continue
+            resp = func([system, user]) if method != "__call__" else chat([system, user])
+            if isinstance(resp, list) and resp and hasattr(resp[0], "content"):
+                return resp[0].content
+            if hasattr(resp, "content"):
+                return resp.content
+            if isinstance(resp, str):
+                return resp
+            return str(resp)
+        except Exception:
+            continue
+    raise RuntimeError("Unable to call ChatOpenAI with known methods.")
 
-    try:
-        resp = chat.predict_messages([system, user])
-        if hasattr(resp, "content"):
-            return resp.content
-        return str(resp)
-    except Exception as e:
-        logger.debug("chat.predict_messages failed: %s", e)
-
-    try:
-        resp = chat.predict([system, user])
-        if hasattr(resp, "content"):
-            return resp.content
-        return str(resp)
-    except Exception as e:
-        logger.debug("chat.predict failed: %s", e)
-
-    try:
-        resp = chat([system, user])
-        if hasattr(resp, "content"):
-            return resp.content
-        return str(resp)
-    except Exception as e:
-        logger.debug("chat call-style failed: %s", e)
-
-    raise RuntimeError("Unable to call ChatOpenAI with known methods. Check langchain-openai / langchain-core versions.")
-
-
-# -----------------------
-# Prompt building (lead-level)
-# -----------------------
+# ---------- prompt ----------
 ENHANCED_SCHEMA = {
     "project_name": "string",
     "repo": {"url": "string", "branch": "string", "commit": "string"},
@@ -364,7 +373,7 @@ ENHANCED_SCHEMA = {
     "primary_languages": ["string"],
     "architecture_summary": "string",
     "dependencies": [{"name": "string", "version": "string", "file": "string"}],
-    "key_modules": [{"module_name": "string", "paths": ["string"], "description": "string", "lines": {"start": 1, "end": 10},
+    "key_modules": [{"module_name": "string", "paths": ["string"], "description": "string", "lines": {"start":1,"end":10},
                      "example_snippet": "string", "key_methods": [{"name":"string","signature":"string","loc":10,"cyclomatic_complexity":1.0,"confidence":0.0,"source_ref":{"path":"string","start":1,"end":10}}], "complexity_notes":"string", "recommendations":["string"], "confidence":0.0}],
     "tests_and_ci": {"has_tests": True, "test_paths": ["string"], "ci_present": True},
     "global_complexity_notes": "string",
@@ -373,17 +382,14 @@ ENHANCED_SCHEMA = {
     "assumptions": ["string"]
 }
 
-
-def build_prompt(repo_name: str, modules: List[Dict], contexts: List[Dict]) -> str:
+def build_prompt(repo_name: str, modules: List[Dict[str, Any]], contexts: List[Dict[str, Any]]) -> str:
     evidence = []
     for m in modules[:40]:
         funcs = m.get("top_functions", [])[:4]
         funcs_s = "\n".join([f"- {f['name']} (loc={f['loc']}, cc={f['cyclomatic']}, start={f['start_line']})" for f in funcs])
         evidence.append(f"[file: {m['path']}]\nlang: {m['language']}\nlines: {m['total_lines']}\nfunctions:\n{funcs_s}\nsnippet:\n{m['sample_snippet'][:800]}")
     evidence_blob = "\n\n===MODULE_EVIDENCE===\n\n".join(evidence)
-
     contexts_blob = "\n\n---\n\n".join([f"[file: {c.get('path')}#{c.get('chunk_index')}]\n{(c.get('document') or '')[:1500]}" for c in contexts])
-
     prompt = f"""
 You are a senior engineering lead. Using the evidence and code contexts below, produce a single JSON document exactly matching the schema described and populated with high-confidence findings.
 
@@ -405,60 +411,101 @@ RETRIEVED CONTEXTS:
 """
     return prompt
 
+# ---------- priority_key & grouping ----------
+def priority_key(m: Dict[str, Any]) -> tuple:
+    p = (m.get("path") or "").lower()
+    # controllers
+    if any(x in p for x in ["controller", "controllers"]):
+        return (0, p)
+    # services
+    if any(x in p for x in ["service", "services", "serviceimpl"]):
+        return (1, p)
+    # repositories / dao
+    if any(x in p for x in ["repository", "repositories", "respository", "repo", "/dao/"]):
+        return (2, p)
+    # entities / models
+    if any(x in p for x in ["entity", "entities", "model", "models", "domain", "pojo"]):
+        return (3, p)
+    # security / config / auth
+    if any(x in p for x in ["security", "securingweb", "auth", "config"]):
+        return (4, p)
+    return (5, p)
 
-# -----------------------
-# Orchestration
-# -----------------------
+def group_modules_by_role(modules: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    groups = {"controllers": [], "services": [], "repositories": [], "entities": [], "security": [], "other": []}
+    for m in modules:
+        p = (m.get("path") or "").lower()
+        if any(x in p for x in ["controller", "controllers"]):
+            groups["controllers"].append(m)
+        elif any(x in p for x in ["service", "services", "serviceimpl"]):
+            groups["services"].append(m)
+        elif any(x in p for x in ["repository", "repositories", "respository", "repo", "/dao/"]):
+            groups["repositories"].append(m)
+        elif any(x in p for x in ["entity", "entities", "model", "models", "domain", "pojo"]):
+            groups["entities"].append(m)
+        elif any(x in p for x in ["security", "securingweb", "auth", "config"]):
+            groups["security"].append(m)
+        else:
+            groups["other"].append(m)
+    return groups
+
+# ---------- orchestration ----------
 def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     repo_path = clone_or_update(git_url, WORKSPACE_DIR, repo_name)
     repo_basename = Path(repo_path).name
     collection = f"repo_{repo_basename.lower()}"
-
     logger.info("Loaded repo: %s -> collection %s", repo_path, collection)
 
     code_docs = load_codebase(repo_path)
+    if not isinstance(code_docs, list):
+        raise RuntimeError("load_codebase must return a list of docs with 'path' and 'content'")
+
+    # Prioritize using priority_key
+    code_docs = sorted(code_docs, key=priority_key)
+
     if MAX_FILES > 0:
         code_docs = code_docs[:MAX_FILES]
-    logger.info("Discovered %d code documents", len(code_docs))
 
-    logger.info("Running static analysis...")
+    logger.info("Discovered %d code documents (prioritized)", len(code_docs))
+
     modules = analyze_code_docs(code_docs)
 
-    # ---------------------
-    # Parallel chunking
-    # ---------------------
-    logger.info("Chunking files in parallel (%d workers)...", CHUNKER_WORKERS)
-    file_docs_all: List[Dict] = []
+    # Keep modules sorted consistently by priority_key
+    modules = sorted(modules, key=priority_key)
+
+    # Group modules for output
+    grouped = group_modules_by_role(modules)
+
+    # Chunking
+    logger.info("Chunking files (%d workers)...", CHUNKER_WORKERS)
+    file_docs_all: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=CHUNKER_WORKERS) as tpe:
-        futures = {tpe.submit(process_file_to_chunks, doc): doc.get("path", "<unknown>") for doc in code_docs}
-        for fut in as_completed(futures):
-            path = futures[fut]
+        futs = {tpe.submit(process_file_to_chunks, doc): doc.get("path", "<unknown>") for doc in code_docs}
+        for fut in as_completed(futs):
+            path = futs[fut]
             try:
-                file_docs = fut.result()
-                file_docs_all.extend(file_docs)
+                file_docs_all.extend(fut.result())
             except Exception as e:
                 logger.exception("Chunking failed for %s: %s", path, e)
 
     total_chunks = len(file_docs_all)
     logger.info("Produced %d chunks across %d files", total_chunks, len(code_docs))
 
-    # Ensure collection once
+    # Ensure vector collection
     if total_chunks > 0:
         if DRY_RUN:
             vector_size = 1
         else:
-            sample_text = file_docs_all[0]["text"][:128]
             try:
+                sample_text = file_docs_all[0]["text"][:128]
                 vector_size = len(_get_langchain_embeddings().embed_documents([sample_text])[0])
             except Exception:
                 vector_size = 1536
         vs.ensure_collection(collection, vector_size)
 
-    # ---------------------
-    # Parallel embed + upsert
-    # ---------------------
-    logger.info("Embedding & upserting in parallel (%d workers) with batch size %d...", UPSERTER_WORKERS, UPSERT_BATCH)
-    batches = [file_docs_all[i: i + UPSERT_BATCH] for i in range(0, len(file_docs_all), UPSERT_BATCH)]
+    # Embed & upsert
+    logger.info("Embedding & upserting ...")
+    batches = [file_docs_all[i:i+UPSERT_BATCH] for i in range(0, len(file_docs_all), UPSERT_BATCH)]
     upserted_total = 0
     with ThreadPoolExecutor(max_workers=UPSERTER_WORKERS) as tpe:
         fut_map = {tpe.submit(embed_and_upsert_batch, collection, batch, DRY_RUN): idx for idx, batch in enumerate(batches)}
@@ -467,30 +514,24 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
             try:
                 upserted = fut.result()
                 upserted_total += upserted
-                logger.info("[upsert] Batch %d/%d upserted %d points", idx + 1, len(batches), upserted)
             except Exception as e:
                 logger.exception("Upsert batch %d failed: %s", idx + 1, e)
+    logger.info("Upserted %d points", upserted_total)
 
-    logger.info("Created and upserted %d points", upserted_total)
-
-    # ---------------------
     # Retrieval + LLM
-    # ---------------------
-    logger.info("Retrieving top-k contexts")
     contexts = retrieve_top_k_from_qdrant(collection, "Provide high-level summary, architecture, key methods, and risks", k=TOP_K)
-
-    logger.info("Building prompt and calling chat model...")
     prompt = build_prompt(repo_basename, modules, contexts)
+
     if SKIP_CHAT or DRY_RUN:
-        logger.info("Skipping chat (SKIP_CHAT/DRY_RUN). Writing minimal JSON output.")
         out = {
             "project_name": repo_basename,
             "repo": {"url": git_url, "branch": "unknown", "commit": "unknown"},
             "project_overview": "DRY_RUN",
-            "primary_languages": list({m["language"] for m in modules}),
+            "primary_languages": sorted(list({m["language"] for m in modules})),
             "architecture_summary": "",
             "dependencies": [],
-            "key_modules": modules[:8],
+            "key_modules": modules[:20],
+            "grouped_modules": grouped,
             "tests_and_ci": {"has_tests": False, "test_paths": [], "ci_present": False},
             "global_complexity_notes": "",
             "recommendations": [],
@@ -498,7 +539,7 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
             "assumptions": ["dry-run"]
         }
     else:
-        system = SystemMessage(content="You are a senior engineering lead. Output only JSON and follow instructions.")
+        system = SystemMessage(content="You are a senior engineering lead. Output only JSON and follow instructions exactly.")
         user = HumanMessage(content=prompt)
         raw = call_chat_robust(system, user)
         try:
@@ -509,10 +550,12 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
             if s == -1 or e == -1:
                 raise RuntimeError("LLM response did not contain JSON.")
             out = json.loads(raw[s:e+1])
+        # attach grouped modules as additional metadata (non-invasive)
+        out.setdefault("grouped_modules", grouped)
 
-    if "generated_at" not in out:
-        out["generated_at"] = datetime.utcnow().isoformat() + "Z"
-    out.setdefault("key_modules", [])
+    # Ensure generated_at
+    out.setdefault("generated_at", datetime.utcnow().isoformat() + "Z")
+    out.setdefault("key_modules", out.get("key_modules", []))
 
     out_dir = Path(OUTPUT_DIR) / repo_basename
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -520,21 +563,18 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     out_file.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("Saved report to %s", str(out_file))
 
-    # --- new: run validation if requested ---
+    # Validation (pass Path objects)
     if VALIDATE_AFTER:
         try:
-            # import local validator module (assumes src/validate_report.py exists and defines validate_report)
-            from validate_report import validate_report  # relative import if validate_report.py is in same folder
+            from validate_report import validate_report  # type: ignore
             repo_root = Path(repo_path)
-            # write validated output beside original (optional: pass out path)
             validated_out = out_dir / "extracted_knowledge_validated.json"
             validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
-            logger.info("Validation completed, validated report written to %s", str(validated_out))
+            logger.info("Validation completed -> %s", str(validated_out))
         except Exception as e:
-            logger.exception("Validation step failed: %s", e)
+            logger.exception("Validation failed: %s", e)
 
     return str(out_file)
-
 
 if __name__ == "__main__":
     import argparse
@@ -542,4 +582,4 @@ if __name__ == "__main__":
     p.add_argument("--repo", required=True)
     p.add_argument("--name", required=False)
     args = p.parse_args()
-    analyze_repo(args.repo, repo_name=args.name)
+    print(analyze_repo(args.repo, repo_name=args.name))
