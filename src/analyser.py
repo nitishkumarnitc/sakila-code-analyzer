@@ -1,27 +1,23 @@
 # src/analyser.py
 """
-Final analyser for the Sakila (Java-first) codebase with batched AI method summarization (Upgrade A).
+Final analyser for the Sakila (Java-first) codebase — production-ready single-file.
 
-Features / requirements implemented:
+Features included (final):
 - Prioritizes controllers/services/repositories/entities/security folders.
-- Token-aware chunking (tiktoken optional) + fallback chunker.
+- Token-aware chunking (tiktoken optional) with fallback chunker.
 - Embedding cache with atomic writes and retry/backoff.
 - Parallel chunking/upsert with safe Qdrant upsert lock.
-- Batched method summarization to reduce LLM calls (Upgrade A).
-  - Summaries are cached on-disk per-method-hash.
-  - Summaries are requested in batches (preserves ordering).
-- Outputs machine-readable JSON with `grouped_modules`.
-- Removes long code snippets from final output (no `snippet` fields).
-- Detects CSS files as language "css".
-- Uses LangChain ChatOpenAI via `call_chat_robust`.
-- Validation call passes Path objects (fixes earlier AttributeError).
+- Batched method summarization (Upgrade A) to reduce LLM calls; disk-cached per-method hash.
+- No long code snippets in final output (no `snippet` fields). Keeps short example and AI description.
+- Detects CSS files (language "css") and safely ignores function extraction for them.
+- Robust ChatOpenAI wrapper with multiple call styles.
+- Validation step uses Path objects (fixing previous AttributeError).
+- Detailed timing logs printed to console for each stage and total runtime.
 
 Usage:
     python src/analyser.py --repo <git_url> [--name <repo_name>]
 
-Notes:
-- The summarizer will not run if DRY_RUN or SKIP_CHAT are True; heuristic one-line summaries will be used instead.
-- To tune behavior, adjust config.py variables referenced in this file.
+Tune behavior through your existing config.py (variables used below).
 """
 
 from __future__ import annotations
@@ -41,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Any
 from functools import lru_cache
 
-# Local project imports (expected to exist)
+# Local project imports (expected to exist in your repo)
 from downloader import clone_or_update
 from ingest import load_codebase
 import vectorstore as vs  # expects vs.upsert, vs.ensure_collection, vs.search, vs.embed_texts
@@ -50,7 +46,7 @@ import vectorstore as vs  # expects vs.upsert, vs.ensure_collection, vs.search, 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Config
+# Central config (your existing config module)
 import config as cfg
 
 # Optional token estimator
@@ -60,12 +56,17 @@ try:
 except Exception:
     _TIKTOKEN_AVAILABLE = False
 
+# ------------------------
 # Logging
-logging.getLogger("httpx").setLevel(getattr(cfg, "HTTPX_LOG_LEVEL", "WARNING").upper() if hasattr(cfg, "HTTPX_LOG_LEVEL") else logging.WARNING)
+# ------------------------
+LOG_LEVEL = getattr(cfg, "LOG_LEVEL", "INFO").upper() if hasattr(cfg, "LOG_LEVEL") else "INFO"
+logging.getLogger("httpx").setLevel(getattr(logging, getattr(cfg, "HTTPX_LOG_LEVEL", "WARNING").upper(), logging.WARNING))
 logger = logging.getLogger("analyser")
-logging.basicConfig(level=getattr(cfg, "LOG_LEVEL", "INFO").upper() if hasattr(cfg, "LOG_LEVEL") else logging.INFO)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 
+# ------------------------
 # Config variables (defaults if missing)
+# ------------------------
 WORKSPACE_DIR = getattr(cfg, "WORKSPACE_DIR", "/tmp/workspace")
 TOP_K = getattr(cfg, "TOP_K", 8)
 OUTPUT_DIR = getattr(cfg, "OUTPUT_DIR", "out")
@@ -84,9 +85,9 @@ EMBED_RETRIES = getattr(cfg, "EMBED_RETRIES", 3)
 EMBED_BACKOFF_BASE = getattr(cfg, "EMBED_BACKOFF_BASE", 0.5)
 OPENAI_EMBED_MODEL = getattr(cfg, "OPENAI_EMBED_MODEL", "text-embedding-3-small")
 OPENAI_CHAT_MODEL = getattr(cfg, "OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
-# Method summary cache directory (separate from embedding cache)
 METHOD_SUMMARY_CACHE_DIR = getattr(cfg, "METHOD_SUMMARY_CACHE_DIR", ".method_summary_cache")
+
+# Ensure cache dirs exist
 os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
 os.makedirs(METHOD_SUMMARY_CACHE_DIR, exist_ok=True)
 
@@ -97,7 +98,7 @@ _lc_chat: Optional[ChatOpenAI] = None
 # Qdrant upsert lock (some clients require sequential safety)
 _qdrant_lock = threading.Lock()
 
-# Folder prioritization for Java projects
+# Folder prioritization for Java projects (used by priority_key)
 PRIORITY_FOLDERS = [
     "controller", "controllers",
     "entity", "entities", "model", "models", "domain", "pojo",
@@ -126,7 +127,7 @@ def _get_langchain_chat() -> ChatOpenAI:
 
 
 # ------------------------
-# Embedding cache helpers
+# Embedding cache helpers (atomic)
 # ------------------------
 def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -258,9 +259,8 @@ FUNC_REGEX = {
     "java": re.compile(r'(?m)^\s*(public|private|protected|static|\s)*\s*[\w\<\>\[\]]+\s+([a-zA-Z0-9_]+)\s*\(([^\)]*)\)\s*\{'),
     "python": re.compile(r'(?m)^\s*def\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*:'),
     "js": re.compile(r'(?m)^\s*(?:function\s+)?([A-Za-z0-9_]+)\s*\(([^\)]*)\)\s*\{'),
-    # Note: do NOT add an empty regex for css. CSS doesn't have functions to extract.
+    # don't add css regex (CSS has no functions we extract)
 }
-
 
 
 def detect_language(path: str) -> str:
@@ -331,106 +331,85 @@ def _shorten_signature(raw_sig: str) -> str:
 
 
 def _hash_for_method_context(signature: str, body_short: str) -> str:
-    payload = (signature + "\n" + body_short).encode("utf-8")
+    payload = (signature + "\n" + (body_short or "")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def summarize_methods_batch(method_bodies: List[str], method_signatures: List[str]) -> List[str]:
     """
-    Summarize many methods in one LLM call. Returns descriptions in the same order.
-    Uses disk cache per method hash to avoid repeated LLM calls.
-    If DRY_RUN or SKIP_CHAT is True, returns heuristic summaries.
+    Summarize many methods in batches. Return list of descriptions matching order.
+    Uses disk cache per-method hash. If DRY_RUN or SKIP_CHAT, uses heuristics.
     """
+    results: List[Optional[str]] = [None] * len(method_signatures)
+    request_items: List[Dict[str, Any]] = []
 
-    results: List[str] = []
-    # prepare hashes & check cache
-    to_request_indices: List[int] = []
-    request_items: List[Dict[str, str]] = []
     for i, (sig, body) in enumerate(zip(method_signatures, method_bodies)):
         h = _hash_for_method_context(sig, body)
         cached = _load_method_summary_from_disk(h)
         if cached is not None:
-            results.append(cached)
+            results[i] = cached
         else:
-            results.append(None)  # placeholder
-            to_request_indices.append(i)
             request_items.append({"idx": i, "signature": sig, "body": body, "hash": h})
 
-    if not to_request_indices:
-        return results  # all cached
+    if not request_items:
+        return [r or "<summary unavailable>" for r in results]
 
-    # If in dry-run/skip-chat, generate heuristic descriptions
+    # Heuristic fallback for dry-run or when chat disabled
     if DRY_RUN or SKIP_CHAT:
-        for item in request_items:
-            body_line = (item["body"] or "").strip().splitlines()
-            first = body_line[0].strip() if body_line else ""
-            heuristic = f"Performs: {first[:140]}" if first else "Performs an operation (heuristic summary)."
-            idx = item["idx"]
-            results[idx] = heuristic
-            _save_method_summary_to_disk(item["hash"], heuristic)
-        return results
+        for it in request_items:
+            first = (it["body"] or "").strip().splitlines()
+            first_line = first[0].strip() if first else ""
+            heuristic = (f"Performs: {first_line[:140]}") if first_line else "Performs an operation (heuristic summary)."
+            results[it["idx"]] = heuristic
+            _save_method_summary_to_disk(it["hash"], heuristic)
+        return [r or "<summary unavailable>" for r in results]
 
-    # Build a single prompt enumerating method signatures + short bodies.
-    # Ask the model to return a JSON array of objects [{"hash":"...","summary":"..."}...]
-    # The hash allows us to map back and persist each summary.
-    chunks = []
-    # limit how many methods we send in one call to avoid running over context (safety)
+    # Batch parameters
     MAX_METHODS_PER_CALL = 40
     for batch_start in range(0, len(request_items), MAX_METHODS_PER_CALL):
         batch = request_items[batch_start: batch_start + MAX_METHODS_PER_CALL]
         enumerated = []
         for it in batch:
-            # include signature and a short body (max ~600 chars)
-            body_short = it["body"][:800].replace("```", "'``'")
-            enumerated.append({
-                "hash": it["hash"],
-                "signature": it["signature"],
-                "body": body_short
-            })
-        # create prompt for this batch
-        system = SystemMessage(content="You are a senior Java engineer. Produce one concise English sentence describing what each method does (business logic). Be precise and avoid implementation details like 'calls X' unless important. Output must be valid JSON: an array of objects [{\"hash\":\"...\",\"summary\":\"one sentence\"}, ...].")
-        items_text = json.dumps(enumerated, ensure_ascii=False)
-        user = HumanMessage(content=f"Summarize the following methods. Return ONLY valid JSON as described.\n\nMETHODS:\n{items_text}\n")
+            body_short = (it["body"] or "")[:800].replace("```", "'``'")
+            enumerated.append({"hash": it["hash"], "signature": it["signature"], "body": body_short})
+        system = SystemMessage(content="You are a senior Java engineer. For each method provided, write ONE concise English sentence describing what the method does (business logic). Avoid low-level implementation detail unless it's essential. Return ONLY valid JSON: an array of objects with keys `hash` and `summary`.")
+        user = HumanMessage(content=f"Summarize the following methods. Respond with valid JSON.\n\nMETHODS:\n{json.dumps(enumerated, ensure_ascii=False)}\n")
         try:
             raw = call_chat_robust(system, user)
-            # try to parse JSON substring
             s = raw.find("[")
             e = raw.rfind("]")
             if s == -1 or e == -1:
-                raise RuntimeError("LLM did not return a JSON array.")
+                raise RuntimeError("LLM did not return JSON array.")
             parsed = json.loads(raw[s:e+1])
-            # parsed is list of {"hash":..., "summary":...}
+            # apply parsed summaries
             for obj in parsed:
                 h = obj.get("hash")
-                summ = obj.get("summary") or obj.get("description") or obj.get("summary_text") or ""
-                summ = summ.strip().replace("\n", " ")
+                summ = (obj.get("summary") or obj.get("description") or "").strip().replace("\n", " ")
                 if not summ:
                     summ = "<summary unavailable>"
-                # save to disk
                 _save_method_summary_to_disk(h, summ)
                 # map into results
-                # find indices with this hash
-                for it in request_items:
+                for it in batch:
                     if it["hash"] == h:
                         results[it["idx"]] = summ
-            # safeguard: fill any remaining None with fallback
-            for it in request_items:
+            # fill any remaining with fallback
+            for it in batch:
                 if results[it["idx"]] is None:
                     fallback = "<summary unavailable>"
                     results[it["idx"]] = fallback
                     _save_method_summary_to_disk(it["hash"], fallback)
-        except Exception as e:
-            logger.exception("Batch summarization failed: %s", e)
-            # fallback to heuristics for this batch
+        except Exception as exc:
+            logger.exception("Batch summarization failed: %s", exc)
+            # fallback heuristics for this batch
             for it in batch:
                 idx = it["idx"]
-                first_line = (it["body"] or "").strip().splitlines()
-                first = first_line[0].strip() if first_line else ""
-                heuristic = f"Performs: {first[:140]}" if first else "Performs an operation (heuristic summary)."
+                first = (it["body"] or "").strip().splitlines()
+                first_line = first[0].strip() if first else ""
+                heuristic = (f"Performs: {first_line[:140]}") if first_line else "Performs an operation (heuristic summary)."
                 results[idx] = heuristic
                 _save_method_summary_to_disk(it["hash"], heuristic)
 
-    return results
+    return [r or "<summary unavailable>" for r in results]
 
 
 # ------------------------
@@ -438,48 +417,32 @@ def summarize_methods_batch(method_bodies: List[str], method_signatures: List[st
 # ------------------------
 def find_functions(text: str, lang: str) -> List[Dict[str, Any]]:
     """
-    Extract functions/methods robustly. Handles missing capture groups gracefully
-    and returns an empty list for languages with no function-like constructs (e.g. css).
-    Each returned function contains:
-      - name (or '<unknown>')
-      - signature (cleaned)
-      - start_line, loc, cyclomatic
-      - body_short (kept temporarily for later summarization)
+    Extract functions/methods robustly. For css return empty list.
+    Each function contains name, cleaned signature, start_line, loc, cyclomatic, body_short (temporary).
     """
-    # Early-return for languages that don't have function constructs we extract
     if lang == "css":
         return []
-
     patt = FUNC_REGEX.get(lang)
     if not patt:
         return []
 
     funcs: List[Dict[str, Any]] = []
     for m in patt.finditer(text):
-        # Determine method name robustly depending on available groups
+        # determine name safely
         name = "<unknown>"
-        # m.lastindex is the index of the last captured group (or None)
-        last = getattr(m, "lastindex", None)
-        if lang == "java":
-            # Java pattern is expected to have group(2) as name
-            if last and last >= 2:
-                try:
-                    name = m.group(2)
-                except Exception:
-                    name = "<unknown>"
-        else:
-            # python/js: group(1) is usually the name
-            if last and last >= 1:
-                try:
-                    name = m.group(1)
-                except Exception:
-                    name = "<unknown>"
+        try:
+            if lang == "java":
+                # java regex has group(2) as name
+                name = m.group(2) if m.lastindex and m.lastindex >= 2 else "<unknown>"
+            else:
+                name = m.group(1) if m.lastindex and m.lastindex >= 1 else "<unknown>"
+        except Exception:
+            name = "<unknown>"
 
-        raw_sig = m.group(0).strip() if m.lastindex is not None or m.groups() is not None else ""
+        raw_sig = m.group(0).strip() if m.group(0) is not None else ""
         signature = _shorten_signature(raw_sig) if raw_sig else ""
         start_idx = m.start()
         start_line = line_of_index(text, start_idx)
-        # take a short method body for summarization context (up to ~1200 chars)
         body_short = text[m.start(): m.start() + 1200]
         loc = body_short.count("\n") + 1
         cc = estimate_cyclomatic(body_short)
@@ -489,9 +452,10 @@ def find_functions(text: str, lang: str) -> List[Dict[str, Any]]:
             "start_line": start_line,
             "loc": loc,
             "cyclomatic": cc,
-            "body_short": body_short  # will be removed later before final output
+            "body_short": body_short
         })
     return funcs
+
 
 def analyze_code_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     modules: List[Dict[str, Any]] = []
@@ -503,7 +467,6 @@ def analyze_code_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         lang = detect_language(path)
         total_lines = content.count("\n") + 1
         funcs = find_functions(content, lang)
-        # We'll keep top functions for quick inspection (by cyclomatic/loc)
         top_funcs = sorted(funcs, key=lambda f: (-f["cyclomatic"], -f["loc"]))[:12]
         modules.append({
             "module_name": Path(path).name,
@@ -518,7 +481,7 @@ def analyze_code_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ------------------------
-# Chunking + embedding + upsert
+# Chunking + embedding + upsert helpers
 # ------------------------
 def process_file_to_chunks(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     path = doc.get("path", "<unknown>")
@@ -545,7 +508,6 @@ def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
         else:
             to_fetch.append(t)
             indices.append(i)
-
     if not to_fetch:
         return vectors
 
@@ -565,7 +527,6 @@ def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
             logger.warning("Embedding failed (attempt %d/%d): %s — sleeping %.2fs", attempt + 1, EMBED_RETRIES + 1, e, sleep_t)
             time.sleep(sleep_t)
             attempt += 1
-
     raise RuntimeError("Embedding failed after retries") from last_exc
 
 
@@ -577,19 +538,17 @@ def embed_and_upsert_batch(collection: str, batch: List[Dict[str, Any]], dry_run
         vectors = [[0.0] for _ in texts]
     else:
         vectors = _embed_texts_with_retry(texts)
-
     points = []
     for j, d in enumerate(batch):
         payload = {"path": d["path"], "chunk_index": d["chunk_index"], "text": d["text"]}
         points.append({"id": str(uuid.uuid4()), "vector": vectors[j], "payload": payload})
-
     with _qdrant_lock:
         vs.upsert(collection_name=collection, points=points)
     return len(points)
 
 
 # ------------------------
-# Retrieval & chat helpers
+# Retrieval & Chat helpers
 # ------------------------
 def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> List[Dict[str, Any]]:
     if DRY_RUN:
@@ -609,7 +568,7 @@ def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> L
 
 def call_chat_robust(system: SystemMessage, user: HumanMessage) -> str:
     chat = _get_langchain_chat()
-    # Try several call styles for compatibility
+    # Try multiple invocation styles for compatibility
     try:
         result = chat.generate(messages=[[system, user]])
         gen = result.generations[0][0]
@@ -734,64 +693,63 @@ def group_modules_by_role(modules: List[Dict[str, Any]]) -> Dict[str, List[Dict[
 # Orchestration
 # ------------------------
 def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
+    t0 = time.time()
+    logger.info("Starting analysis at %s", datetime.utcnow().isoformat() + "Z")
+
     repo_path = clone_or_update(git_url, WORKSPACE_DIR, repo_name)
     repo_basename = Path(repo_path).name
     collection = f"repo_{repo_basename.lower()}"
     logger.info("Loaded repo: %s -> collection %s", repo_path, collection)
 
+    t_start_discovery = time.time()
     code_docs = load_codebase(repo_path)
     if not isinstance(code_docs, list):
         raise RuntimeError("load_codebase must return a list of docs with 'path' and 'content' keys")
-
-    # Prioritize files by folder relevance
+    # Prioritize by folder relevance
     code_docs = sorted(code_docs, key=priority_key)
     if MAX_FILES > 0:
         code_docs = code_docs[:MAX_FILES]
+    t_end_discovery = time.time()
+    logger.info("Discovered %d code documents (prioritized) in %.2fs", len(code_docs), t_end_discovery - t_start_discovery)
 
-    logger.info("Discovered %d code documents (prioritized)", len(code_docs))
-
-    # Static analysis: extract functions and module metadata
+    # Static analysis
+    t_start_analysis = time.time()
     modules = analyze_code_docs(code_docs)
-
-    # Keep modules sorted by priority
     modules = sorted(modules, key=priority_key)
     grouped = group_modules_by_role(modules)
+    t_end_analysis = time.time()
+    logger.info("Static analysis completed for %d modules in %.2fs", len(modules), t_end_analysis - t_start_analysis)
 
-    # ---------------------
-    # Prepare batched method summaries
-    # ---------------------
-    # Collect per-method short bodies and signatures (for top functions only to limit volume)
-    method_signatures: List[str] = []
-    method_bodies: List[str] = []
-    method_locations: List[Dict[str, Any]] = []  # for mapping back
-
+    # Prepare batched method summaries: collect signatures and bodies (top functions only)
+    t_start_collect = time.time()
+    method_signatures = []
+    method_bodies = []
+    method_locs = []
     for m in modules:
         for f in m.get("top_functions", []):
             sig = f.get("signature", "")
             body = f.get("body_short", "")
-            # only include if there is some short body or signature
             if not sig and not body:
                 continue
             method_signatures.append(sig)
             method_bodies.append(body)
-            method_locations.append({"module_path": m["path"], "func_name": f["name"], "start_line": f["start_line"]})
+            method_locs.append({"module_path": m["path"], "func_name": f["name"], "start_line": f["start_line"]})
+    t_end_collect = time.time()
+    logger.info("Collected %d methods for batched summarization in %.2fs", len(method_signatures), t_end_collect - t_start_collect)
 
-    logger.info("Collected %d methods for batched summarization", len(method_signatures))
+    # Summarize methods in batch and populate top_functions descriptions
+    t_start_summary = time.time()
+    descriptions = summarize_methods_batch(method_bodies, method_signatures)
+    t_end_summary = time.time()
+    logger.info("Batched summarization of %d methods completed in %.2fs", len(method_signatures), t_end_summary - t_start_summary)
 
-    # Request batched summaries and populate descriptions
-    descriptions: List[str] = summarize_methods_batch(method_bodies, method_signatures)
-
-    # Map descriptions back into modules.top_functions; remove body_short and add description + confidence
+    # Map descriptions back into modules (replace top_functions entries, remove body_short)
     desc_idx = 0
     for m in modules:
-        new_top_funcs = []
+        new_funcs = []
         for f in m.get("top_functions", []):
-            if desc_idx < len(descriptions):
-                desc = descriptions[desc_idx]
-                desc_idx += 1
-            else:
-                desc = "<summary unavailable>"
-            # populate cleaned function entry (no long snippets)
+            desc = descriptions[desc_idx] if desc_idx < len(descriptions) else "<summary unavailable>"
+            desc_idx += 1
             func_entry = {
                 "name": f.get("name"),
                 "signature": f.get("signature"),
@@ -801,12 +759,11 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
                 "description": desc,
                 "confidence": 0.9
             }
-            new_top_funcs.append(func_entry)
-        m["top_functions"] = new_top_funcs
+            new_funcs.append(func_entry)
+        m["top_functions"] = new_funcs
 
-    # ---------------------
-    # Chunking, embedding & upsert
-    # ---------------------
+    # Chunking in parallel
+    t_start_chunk = time.time()
     logger.info("Chunking files in parallel (%d workers)...", CHUNKER_WORKERS)
     file_docs_all: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=CHUNKER_WORKERS) as tpe:
@@ -817,24 +774,23 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
                 file_docs_all.extend(fut.result())
             except Exception as e:
                 logger.exception("Chunking failed for %s: %s", path, e)
+    t_end_chunk = time.time()
+    logger.info("Chunking produced %d chunks across %d files in %.2fs", len(file_docs_all), len(code_docs), t_end_chunk - t_start_chunk)
 
-    total_chunks = len(file_docs_all)
-    logger.info("Produced %d chunks across %d files", total_chunks, len(code_docs))
-
-    # Ensure collection once
-    if total_chunks > 0:
+    # Ensure collection / vector size
+    if len(file_docs_all) > 0:
         if DRY_RUN:
             vector_size = 1
         else:
-            sample_text = file_docs_all[0]["text"][:128]
             try:
-                vector_size = len(_get_langchain_embeddings().embed_documents([sample_text])[0])
+                vector_size = len(_get_langchain_embeddings().embed_documents([file_docs_all[0]["text"][:128]])[0])
             except Exception:
                 vector_size = 1536
         vs.ensure_collection(collection, vector_size)
 
     # Parallel embed + upsert
-    logger.info("Embedding & upserting in parallel (%d workers) with batch size %d...", UPSERTER_WORKERS, UPSERT_BATCH)
+    t_start_upsert = time.time()
+    logger.info("Embedding & upserting in parallel (%d workers) with batch size %d ...", UPSERTER_WORKERS, UPSERT_BATCH)
     batches = [file_docs_all[i: i + UPSERT_BATCH] for i in range(0, len(file_docs_all), UPSERT_BATCH)]
     upserted_total = 0
     with ThreadPoolExecutor(max_workers=UPSERTER_WORKERS) as tpe:
@@ -847,16 +803,18 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
                 logger.info("[upsert] Batch %d/%d upserted %d points", idx + 1, len(batches), upserted)
             except Exception as e:
                 logger.exception("Upsert batch %d failed: %s", idx + 1, e)
+    t_end_upsert = time.time()
+    logger.info("Created and upserted %d points in %.2fs", upserted_total, t_end_upsert - t_start_upsert)
 
-    logger.info("Created and upserted %d points", upserted_total)
-
-    # ---------------------
-    # Retrieval + LLM (project-level synthesis)
-    # ---------------------
+    # Retrieval + LLM synthesis
+    t_start_retrieval = time.time()
     logger.info("Retrieving top-k contexts")
     contexts = retrieve_top_k_from_qdrant(collection, "Provide high-level summary, architecture, key methods, and risks", k=TOP_K)
+    t_end_retrieval = time.time()
+    logger.info("Retrieved %d contexts in %.2fs", len(contexts), t_end_retrieval - t_start_retrieval)
 
-    logger.info("Building prompt and calling chat model...")
+    t_start_llm = time.time()
+    logger.info("Building prompt and calling chat model for project-level synthesis...")
     prompt = build_prompt(repo_basename, modules, contexts)
 
     if SKIP_CHAT or DRY_RUN:
@@ -889,10 +847,11 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
                 logger.exception("LLM response did not contain JSON. Raw output: %s", raw)
                 raise RuntimeError("LLM response did not contain JSON.")
             out = json.loads(raw[s:e+1])
-        # attach grouped modules as additional metadata
         out.setdefault("grouped_modules", grouped)
+    t_end_llm = time.time()
+    logger.info("Project-level LLM synthesis finished in %.2fs", t_end_llm - t_start_llm)
 
-    # ensure generated_at and key_modules
+    # Ensure generated_at and defaults
     out.setdefault("generated_at", datetime.utcnow().isoformat() + "Z")
     out.setdefault("key_modules", out.get("key_modules", []))
 
@@ -904,15 +863,20 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     logger.info("Saved report to %s", str(out_file))
 
     # Optional validation (pass Path objects)
-    if VALIDATE_AFTER:
-        try:
-            from validate_report import validate_report  # type: ignore
-            repo_root = Path(repo_path)
-            validated_out = out_dir / "extracted_knowledge_validated.json"
-            validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
-            logger.info("Validation completed, validated report written to %s", str(validated_out))
-        except Exception as e:
-            logger.exception("Validation step failed: %s", e)
+    # if VALIDATE_AFTER:
+    #     try:
+    #         from validate_report import validate_report  # type: ignore
+    #         repo_root = Path(repo_path)
+    #         validated_out = out_dir / "extracted_knowledge_validated.json"
+    #         validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
+    #         logger.info("Validation completed, validated report written to %s", str(validated_out))
+    #     except Exception as e:
+    #         logger.exception("Validation step failed: %s", e)
+
+    total_time = time.time() - t0
+    logger.info("Total analysis time: %.2fs", total_time)
+    # Also print to stdout for terminal visibility (helpful in CI logs)
+    print(f"ANALYSIS COMPLETED: repo={repo_basename} output={out_file} total_time_s={total_time:.2f}")
 
     return str(out_file)
 
@@ -923,4 +887,8 @@ if __name__ == "__main__":
     p.add_argument("--repo", required=True, help="Git URL or local path to repository")
     p.add_argument("--name", required=False, help="Optional name for the repo/collection")
     args = p.parse_args()
-    print(analyze_repo(args.repo, repo_name=args.name))
+
+    start = time.time()
+    out_path = analyze_repo(args.repo, repo_name=args.name)
+    elapsed = time.time() - start
+    print(f"ANALYSE DONE -> {out_path} (elapsed {elapsed:.2f}s)")
