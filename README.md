@@ -174,12 +174,11 @@ docker compose up -d qdrant
 
 ## ✔ Full Production Run
 
-```bash
-docker compose run --rm \
-  -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
-  app python -u src/cli.py \
-    --repo https://github.com/janjakovacevic/SakilaProject.git \
-    --name SakilaProject
+```bashdocker compose run --rm \
+  -e DRY_RUN=0 -e SKIP_CHAT=0 -e MAX_FILES=0 -e MAX_MODULE_CALLS=12 \
+  -e TOP_K=6 -e CHUNK_SIZE=1200 -e CHUNK_OVERLAP=200 \
+  -e UPSERT_BATCH=64 -e EMBED_BATCH=64 -e LLM_CALL_TIMEOUT=30 \
+  app python -u src/analyser.py --repo https://github.com/janjakovacevic/SakilaProject.git --name SakilaProject
 ```
 
 This performs:

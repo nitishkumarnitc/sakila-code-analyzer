@@ -925,15 +925,15 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     logger.info("Saved report to %s", str(out_file))
 
     # Optional validation (pass Path objects)
-    if VALIDATE_AFTER:
-        try:
-            from validate_report import validate_report  # type: ignore
-            repo_root = Path(repo_path)
-            validated_out = out_dir / "extracted_knowledge_validated.json"
-            validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
-            logger.info("Validation completed, validated report written to %s", str(validated_out))
-        except Exception as e:
-            logger.exception("Validation step failed: %s", e)
+    # if VALIDATE_AFTER:
+    #     try:
+    #         from validate_report import validate_report  # type: ignore
+    #         repo_root = Path(repo_path)
+    #         validated_out = out_dir / "extracted_knowledge_validated.json"
+    #         validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
+    #         logger.info("Validation completed, validated report written to %s", str(validated_out))
+    #     except Exception as e:
+    #         logger.exception("Validation step failed: %s", e)
 
     total_time = time.time() - t0
     logger.info("Total analysis time: %.2fs", total_time)
