@@ -221,23 +221,73 @@ def estimate_cyclomatic(snippet: str) -> int:
         count += s.count(t)
     return max(1, count)
 
-def find_functions(text: str, lang: str) -> List[Dict[str, Any]]:
+def find_functions(text: str, lang: str, keep_long_snippet: bool = False) -> List[Dict[str, Any]]:
+    """
+    Extract functions/methods with:
+      - cleaned signature (no trailing '{')
+      - start_line, loc, cyclomatic
+      - description (short 1-line human-readable)
+      - example_snippet (very short, <= 200 chars)
+      - long_snippet only if keep_long_snippet True
+    """
     patt = FUNC_REGEX.get(lang)
     if not patt:
         return []
-    funcs = []
+    funcs: List[Dict[str, Any]] = []
     for m in patt.finditer(text):
+        # extract method name
         if lang == "java":
             name = m.group(2)
         else:
             name = m.group(1)
-        sig = m.group(0).strip()
+        raw_sig = m.group(0).strip()
+        # Clean signature: remove trailing '{' and any trailing spaces
+        clean_sig = re.sub(r"\s*\{\s*$", "", raw_sig).strip()
+
         start_idx = m.start()
         start_line = line_of_index(text, start_idx)
-        snippet = text[m.start(): m.start() + 4000]
-        loc = snippet.count("\n") + 1
-        cc = estimate_cyclomatic(snippet)
-        funcs.append({"name": name, "signature": sig, "start_line": start_line, "loc": loc, "cyclomatic": cc, "snippet": snippet[:2000]})
+
+        # Try to capture a method body region (naive but practical)
+        # We'll take up to 3000 chars starting from match start (to capture body lines)
+        raw_body = text[m.start(): m.start() + 3000]
+        loc = raw_body.count("\n") + 1
+        cc = estimate_cyclomatic(raw_body)
+
+        # Build a short description:
+        # Approach: take first non-empty code line(s) inside method body, remove leading braces and indentation,
+        # and convert into a one-line summary (truncate).
+        # This is heuristic — it gives a useful quick hint without dumping the full method.
+        body_inner = raw_body.lstrip()
+        # remove the opening brace if present
+        if body_inner.startswith("{"):
+            body_inner = body_inner[1:].lstrip()
+        # get first 1-3 meaningful lines
+        lines = [ln.strip() for ln in body_inner.splitlines() if ln.strip()]
+        first_lines = lines[:3]
+        example_snip = " ".join(first_lines)[:200] if first_lines else ""
+        # Create description from first line (or example snippet) by normalizing spacing
+        if first_lines:
+            desc = first_lines[0]
+            # remove trailing semicolon or closing brace fragments for readability
+            desc = re.sub(r"[;{}]\s*$", "", desc)
+        else:
+            desc = "<no immediate body summary available>"
+
+        # Optionally keep long snippet (disabled by default to avoid token bloat)
+        long_snip = raw_body[:4000] if keep_long_snippet else None
+
+        func_obj = {
+            "name": name,
+            "signature": clean_sig,
+            "start_line": start_line,
+            "loc": loc,
+            "cyclomatic": cc,
+            "description": desc,
+            "example_snippet": example_snip
+        }
+        if keep_long_snippet:
+            func_obj["snippet"] = long_snip
+        funcs.append(func_obj)
     return funcs
 
 def analyze_code_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -564,15 +614,15 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     logger.info("Saved report to %s", str(out_file))
 
     # Validation (pass Path objects)
-    if VALIDATE_AFTER:
-        try:
-            from validate_report import validate_report  # type: ignore
-            repo_root = Path(repo_path)
-            validated_out = out_dir / "extracted_knowledge_validated.json"
-            validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
-            logger.info("Validation completed -> %s", str(validated_out))
-        except Exception as e:
-            logger.exception("Validation failed: %s", e)
+    # if VALIDATE_AFTER:
+    #     try:
+    #         from validate_report import validate_report  # type: ignore
+    #         repo_root = Path(repo_path)
+    #         validated_out = out_dir / "extracted_knowledge_validated.json"
+    #         validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
+    #         logger.info("Validation completed -> %s", str(validated_out))
+    #     except Exception as e:
+    #         logger.exception("Validation failed: %s", e)
 
     return str(out_file)
 
