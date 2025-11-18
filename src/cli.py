@@ -1,5 +1,5 @@
 import argparse
-from analyzer import analyze_repo
+from analyser import analyze_repo
 
 def main():
     parser = argparse.ArgumentParser()
