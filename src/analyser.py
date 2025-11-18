@@ -2,22 +2,27 @@
 """
 Final analyser for the Sakila (Java-first) codebase — production-ready single-file.
 
-Features included (final):
-- Prioritizes controllers/services/repositories/entities/security folders.
-- Token-aware chunking (tiktoken optional) with fallback chunker.
+This version includes:
+- Prioritization for controllers/services/repositories/entities/security folders.
+- Token-aware chunking (tiktoken optional) + fallback chunker.
 - Embedding cache with atomic writes and retry/backoff.
 - Parallel chunking/upsert with safe Qdrant upsert lock.
-- Batched method summarization (Upgrade A) to reduce LLM calls; disk-cached per-method hash.
+- Batched method summarization (Upgrade A) with:
+    - smaller default batch size,
+    - retries & exponential backoff,
+    - timeout and heartbeat logging while waiting for the LLM,
+    - disk cache per-method hash,
+    - fallback heuristics when LLM calls fail.
 - No long code snippets in final output (no `snippet` fields). Keeps short example and AI description.
 - Detects CSS files (language "css") and safely ignores function extraction for them.
 - Robust ChatOpenAI wrapper with multiple call styles.
-- Validation step uses Path objects (fixing previous AttributeError).
-- Detailed timing logs printed to console for each stage and total runtime.
+- Validation step uses Path objects (fixes earlier AttributeError).
+- Detailed timing logs printed to stdout for terminal visibility.
 
 Usage:
     python src/analyser.py --repo <git_url> [--name <repo_name>]
 
-Tune behavior through your existing config.py (variables used below).
+Tune behavior through environment variables or your existing config.py (variables used below).
 """
 
 from __future__ import annotations
@@ -33,11 +38,11 @@ import hashlib
 import threading
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from typing import List, Dict, Optional, Any
 from functools import lru_cache
 
-# Local project imports (expected to exist in your repo)
+# Local project imports (expected to exist in your environment)
 from downloader import clone_or_update
 from ingest import load_codebase
 import vectorstore as vs  # expects vs.upsert, vs.ensure_collection, vs.search, vs.embed_texts
@@ -60,7 +65,8 @@ except Exception:
 # Logging
 # ------------------------
 LOG_LEVEL = getattr(cfg, "LOG_LEVEL", "INFO").upper() if hasattr(cfg, "LOG_LEVEL") else "INFO"
-logging.getLogger("httpx").setLevel(getattr(logging, getattr(cfg, "HTTPX_LOG_LEVEL", "WARNING").upper(), logging.WARNING))
+if hasattr(cfg, "HTTPX_LOG_LEVEL"):
+    logging.getLogger("httpx").setLevel(getattr(logging, cfg.HTTPX_LOG_LEVEL.upper(), logging.WARNING))
 logger = logging.getLogger("analyser")
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 
@@ -68,24 +74,27 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 # Config variables (defaults if missing)
 # ------------------------
 WORKSPACE_DIR = getattr(cfg, "WORKSPACE_DIR", "/tmp/workspace")
-TOP_K = getattr(cfg, "TOP_K", 8)
+TOP_K = int(getattr(cfg, "TOP_K", 8))
 OUTPUT_DIR = getattr(cfg, "OUTPUT_DIR", "out")
-DRY_RUN = getattr(cfg, "DRY_RUN", True)
-SKIP_CHAT = getattr(cfg, "SKIP_CHAT", True)
-CHUNK_SIZE = getattr(cfg, "CHUNK_SIZE", 2400)
-CHUNK_OVERLAP = getattr(cfg, "CHUNK_OVERLAP", 200)
-UPSERT_BATCH = getattr(cfg, "UPSERT_BATCH", 16)
-EMBED_BATCH = getattr(cfg, "EMBED_BATCH", 16)
-VALIDATE_AFTER = getattr(cfg, "VALIDATE_AFTER", False)
-CHUNKER_WORKERS = getattr(cfg, "CHUNKER_WORKERS", 4)
-UPSERTER_WORKERS = getattr(cfg, "UPSERTER_WORKERS", 4)
-MAX_FILES = getattr(cfg, "MAX_FILES", -1)
+DRY_RUN = bool(int(getattr(cfg, "DRY_RUN", 1)))
+SKIP_CHAT = bool(int(getattr(cfg, "SKIP_CHAT", 1)))
+CHUNK_SIZE = int(getattr(cfg, "CHUNK_SIZE", 2400))
+CHUNK_OVERLAP = int(getattr(cfg, "CHUNK_OVERLAP", 200))
+UPSERT_BATCH = int(getattr(cfg, "UPSERT_BATCH", 16))
+EMBED_BATCH = int(getattr(cfg, "EMBED_BATCH", 16))
+VALIDATE_AFTER = bool(int(getattr(cfg, "VALIDATE_AFTER", 0)))
+CHUNKER_WORKERS = int(getattr(cfg, "CHUNKER_WORKERS", 4))
+UPSERTER_WORKERS = int(getattr(cfg, "UPSERTER_WORKERS", 4))
+MAX_FILES = int(getattr(cfg, "MAX_FILES", -1))
 EMBED_CACHE_DIR = getattr(cfg, "EMBED_CACHE_DIR", ".embed_cache")
-EMBED_RETRIES = getattr(cfg, "EMBED_RETRIES", 3)
-EMBED_BACKOFF_BASE = getattr(cfg, "EMBED_BACKOFF_BASE", 0.5)
+EMBED_RETRIES = int(getattr(cfg, "EMBED_RETRIES", 3))
+EMBED_BACKOFF_BASE = float(getattr(cfg, "EMBED_BACKOFF_BASE", 0.5))
 OPENAI_EMBED_MODEL = getattr(cfg, "OPENAI_EMBED_MODEL", "text-embedding-3-small")
 OPENAI_CHAT_MODEL = getattr(cfg, "OPENAI_CHAT_MODEL", "gpt-4o-mini")
 METHOD_SUMMARY_CACHE_DIR = getattr(cfg, "METHOD_SUMMARY_CACHE_DIR", ".method_summary_cache")
+
+# LLM call timeout (seconds) - can be overridden with env var
+LLM_CALL_TIMEOUT = int(os.getenv("LLM_CALL_TIMEOUT", "30"))
 
 # Ensure cache dirs exist
 os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
@@ -292,7 +301,7 @@ def estimate_cyclomatic(snippet: str) -> int:
 
 
 # ------------------------
-# Method summarization (Batch + cache)
+# Method summarization (Batch + cache) with retries, backoff, timeout and heartbeat
 # ------------------------
 def _method_summary_cache_path(h: str) -> str:
     return os.path.join(METHOD_SUMMARY_CACHE_DIR, f"{h}.txt")
@@ -337,12 +346,14 @@ def _hash_for_method_context(signature: str, body_short: str) -> str:
 
 def summarize_methods_batch(method_bodies: List[str], method_signatures: List[str]) -> List[str]:
     """
-    Summarize many methods in batches. Return list of descriptions matching order.
+    Batch summarization with smaller batches, retries, backoff, timeout, and heartbeat.
+    Returns descriptions in the same order as inputs.
     Uses disk cache per-method hash. If DRY_RUN or SKIP_CHAT, uses heuristics.
     """
     results: List[Optional[str]] = [None] * len(method_signatures)
     request_items: List[Dict[str, Any]] = []
 
+    # Prepare request items and check cache
     for i, (sig, body) in enumerate(zip(method_signatures, method_bodies)):
         h = _hash_for_method_context(sig, body)
         cached = _load_method_summary_from_disk(h)
@@ -352,60 +363,113 @@ def summarize_methods_batch(method_bodies: List[str], method_signatures: List[st
             request_items.append({"idx": i, "signature": sig, "body": body, "hash": h})
 
     if not request_items:
+        logger.info("All method summaries loaded from cache; skipping LLM calls.")
         return [r or "<summary unavailable>" for r in results]
 
-    # Heuristic fallback for dry-run or when chat disabled
     if DRY_RUN or SKIP_CHAT:
+        logger.info("DRY_RUN/SKIP_CHAT enabled — using heuristic summaries for %d methods.", len(request_items))
         for it in request_items:
-            first = (it["body"] or "").strip().splitlines()
-            first_line = first[0].strip() if first else ""
-            heuristic = (f"Performs: {first_line[:140]}") if first_line else "Performs an operation (heuristic summary)."
+            first_lines = (it["body"] or "").strip().splitlines()
+            first = first_lines[0].strip() if first_lines else ""
+            heuristic = f"Performs: {first[:140]}" if first else "Performs an operation (heuristic summary)."
             results[it["idx"]] = heuristic
             _save_method_summary_to_disk(it["hash"], heuristic)
         return [r or "<summary unavailable>" for r in results]
 
-    # Batch parameters
-    MAX_METHODS_PER_CALL = 40
-    for batch_start in range(0, len(request_items), MAX_METHODS_PER_CALL):
-        batch = request_items[batch_start: batch_start + MAX_METHODS_PER_CALL]
+    # Tunables (can be overridden via env)
+    BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "12"))
+    MAX_RETRIES = int(os.getenv("LLM_BATCH_RETRIES", "2"))
+    BACKOFF_BASE = float(os.getenv("LLM_BATCH_BACKOFF", "2.0"))
+    HEARTBEAT_INTERVAL = int(os.getenv("LLM_HEARTBEAT_INTERVAL", "5"))
+
+    logger.info("Summarize %d methods using batch_size=%d retries=%d timeout=%ds",
+                len(request_items), BATCH_SIZE, MAX_RETRIES, LLM_CALL_TIMEOUT)
+
+    for batch_start in range(0, len(request_items), BATCH_SIZE):
+        batch = request_items[batch_start: batch_start + BATCH_SIZE]
         enumerated = []
         for it in batch:
-            body_short = (it["body"] or "")[:800].replace("```", "'``'")
+            body_short = (it["body"] or "")[:800].replace("```", "'```'")
             enumerated.append({"hash": it["hash"], "signature": it["signature"], "body": body_short})
-        system = SystemMessage(content="You are a senior Java engineer. For each method provided, write ONE concise English sentence describing what the method does (business logic). Avoid low-level implementation detail unless it's essential. Return ONLY valid JSON: an array of objects with keys `hash` and `summary`.")
+
+        batch_end = batch_start + len(batch) - 1
+        system = SystemMessage(content="You are a senior Java engineer. For each method provided, write ONE concise English sentence describing what the method does (business logic). Avoid low-level implementation detail. Return ONLY valid JSON: an array of objects with keys `hash` and `summary`.")
         user = HumanMessage(content=f"Summarize the following methods. Respond with valid JSON.\n\nMETHODS:\n{json.dumps(enumerated, ensure_ascii=False)}\n")
-        try:
-            raw = call_chat_robust(system, user)
-            s = raw.find("[")
-            e = raw.rfind("]")
-            if s == -1 or e == -1:
-                raise RuntimeError("LLM did not return JSON array.")
-            parsed = json.loads(raw[s:e+1])
-            # apply parsed summaries
-            for obj in parsed:
-                h = obj.get("hash")
-                summ = (obj.get("summary") or obj.get("description") or "").strip().replace("\n", " ")
-                if not summ:
-                    summ = "<summary unavailable>"
-                _save_method_summary_to_disk(h, summ)
-                # map into results
+
+        # retry loop with exponential backoff
+        succeeded = False
+        for attempt in range(0, MAX_RETRIES + 1):
+            attempt_label = f"batch {batch_start}..{batch_end} attempt {attempt+1}/{MAX_RETRIES+1}"
+            logger.info("Summarization: calling LLM for %s (count=%d) timeout=%ds", attempt_label, len(batch), LLM_CALL_TIMEOUT)
+
+            stop_heartbeat = threading.Event()
+
+            def _heartbeat_loop(start_ts: float, label: str):
+                while not stop_heartbeat.wait(HEARTBEAT_INTERVAL):
+                    logger.info("LLM %s still running... elapsed %ds", label, int(time.time() - start_ts))
+
+            start_ts = time.time()
+            hb_thread = threading.Thread(target=_heartbeat_loop, args=(start_ts, attempt_label), daemon=True)
+            hb_thread.start()
+
+            try:
+                with ThreadPoolExecutor(max_workers=1) as execr:
+                    future = execr.submit(call_chat_robust, system, user)
+                    raw = future.result(timeout=LLM_CALL_TIMEOUT)
+
+                stop_heartbeat.set()
+                hb_thread.join(timeout=1)
+
+                logger.info("LLM returned for %s (len raw=%d)", attempt_label, len(raw) if raw else 0)
+
+                s = raw.find("[")
+                e = raw.rfind("]")
+                if s == -1 or e == -1:
+                    logger.warning("LLM (raw) for %s did not contain JSON array. Truncated raw:\n%s", attempt_label, (raw or "")[:2000])
+                    raise RuntimeError("LLM did not return JSON array.")
+
+                parsed = json.loads(raw[s:e+1])
+                for obj in parsed:
+                    h = obj.get("hash")
+                    summ = (obj.get("summary") or obj.get("description") or "").strip().replace("\n", " ")
+                    if not summ:
+                        summ = "<summary unavailable>"
+                    _save_method_summary_to_disk(h, summ)
+                    for it in batch:
+                        if it["hash"] == h:
+                            results[it["idx"]] = summ
+
                 for it in batch:
-                    if it["hash"] == h:
-                        results[it["idx"]] = summ
-            # fill any remaining with fallback
-            for it in batch:
-                if results[it["idx"]] is None:
-                    fallback = "<summary unavailable>"
-                    results[it["idx"]] = fallback
-                    _save_method_summary_to_disk(it["hash"], fallback)
-        except Exception as exc:
-            logger.exception("Batch summarization failed: %s", exc)
-            # fallback heuristics for this batch
+                    if results[it["idx"]] is None:
+                        fallback = "<summary unavailable>"
+                        results[it["idx"]] = fallback
+                        _save_method_summary_to_disk(it["hash"], fallback)
+
+                succeeded = True
+                break
+
+            except FutureTimeoutError:
+                stop_heartbeat.set()
+                hb_thread.join(timeout=1)
+                logger.warning("LLM timeout for %s after %ds", attempt_label, LLM_CALL_TIMEOUT)
+            except Exception as exc:
+                stop_heartbeat.set()
+                hb_thread.join(timeout=1)
+                logger.exception("LLM error for %s: %s", attempt_label, exc)
+
+            # backoff before next attempt
+            if attempt < MAX_RETRIES:
+                backoff = BACKOFF_BASE ** attempt
+                logger.info("Retrying %s after %.1fs backoff", attempt_label, backoff)
+                time.sleep(backoff)
+
+        if not succeeded:
+            logger.error("All LLM attempts failed for batch %d..%d — using heuristics", batch_start, batch_end)
             for it in batch:
                 idx = it["idx"]
-                first = (it["body"] or "").strip().splitlines()
-                first_line = first[0].strip() if first else ""
-                heuristic = (f"Performs: {first_line[:140]}") if first_line else "Performs an operation (heuristic summary)."
+                first_lines = (it["body"] or "").strip().splitlines()
+                first = first_lines[0].strip() if first_lines else ""
+                heuristic = f"Performs: {first[:140]}" if first else "Performs an operation (heuristic summary)."
                 results[idx] = heuristic
                 _save_method_summary_to_disk(it["hash"], heuristic)
 
@@ -428,11 +492,9 @@ def find_functions(text: str, lang: str) -> List[Dict[str, Any]]:
 
     funcs: List[Dict[str, Any]] = []
     for m in patt.finditer(text):
-        # determine name safely
         name = "<unknown>"
         try:
             if lang == "java":
-                # java regex has group(2) as name
                 name = m.group(2) if m.lastindex and m.lastindex >= 2 else "<unknown>"
             else:
                 name = m.group(1) if m.lastindex and m.lastindex >= 1 else "<unknown>"
@@ -568,7 +630,7 @@ def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> L
 
 def call_chat_robust(system: SystemMessage, user: HumanMessage) -> str:
     chat = _get_langchain_chat()
-    # Try multiple invocation styles for compatibility
+    # Try multiple invocation styles to be robust across langchain versions
     try:
         result = chat.generate(messages=[[system, user]])
         gen = result.generations[0][0]
@@ -863,15 +925,15 @@ def analyze_repo(git_url: str, repo_name: Optional[str] = None) -> str:
     logger.info("Saved report to %s", str(out_file))
 
     # Optional validation (pass Path objects)
-    # if VALIDATE_AFTER:
-    #     try:
-    #         from validate_report import validate_report  # type: ignore
-    #         repo_root = Path(repo_path)
-    #         validated_out = out_dir / "extracted_knowledge_validated.json"
-    #         validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
-    #         logger.info("Validation completed, validated report written to %s", str(validated_out))
-    #     except Exception as e:
-    #         logger.exception("Validation step failed: %s", e)
+    if VALIDATE_AFTER:
+        try:
+            from validate_report import validate_report  # type: ignore
+            repo_root = Path(repo_path)
+            validated_out = out_dir / "extracted_knowledge_validated.json"
+            validate_report(report_path=out_file, repo_root=repo_root, out_path=validated_out)
+            logger.info("Validation completed, validated report written to %s", str(validated_out))
+        except Exception as e:
+            logger.exception("Validation step failed: %s", e)
 
     total_time = time.time() - t0
     logger.info("Total analysis time: %.2fs", total_time)
