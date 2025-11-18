@@ -287,7 +287,7 @@ def embed_and_upsert_batch(collection: str, batch: List[Dict], dry_run: bool = D
         points.append({"id": str(uuid.uuid4()), "vector": vectors[j], "payload": payload})
 
     with _qdrant_lock:
-        vs.client.upsert(collection_name=collection, points=points)
+        vs.upsert(collection_name=collection, points=points)
     return len(points)
 
 
@@ -297,16 +297,21 @@ def embed_and_upsert_batch(collection: str, batch: List[Dict], dry_run: bool = D
 def retrieve_top_k_from_qdrant(collection: str, query: str, k: int = TOP_K) -> List[Dict]:
     if DRY_RUN:
         return [{"path": "<dry-run>", "chunk_index": 0, "document": "dry-run context snippet"}]
-    q_emb = _get_langchain_embeddings().embed_query(query)
-    hits = vs.client.search(collection_name=collection, query_vector=q_emb, limit=k)
+
+    q_emb = vs.embed_texts([query])[0]
+    raw = vs.search(collection_name=collection, query_vector=q_emb, limit=k, with_payload=True)
+    # raw is list of {"payload": {...}, "score": ...}
     contexts = []
-    for h in hits:
-        payload = getattr(h, "payload", None) or (h.get("payload") if isinstance(h, dict) else {})
-        text = payload.get("text") or ""
-        path = payload.get("path") or ""
-        chunk_index = payload.get("chunk_index", None)
-        contexts.append({"path": path, "chunk_index": chunk_index, "document": text})
+    for h in raw:
+        payload = h.get("payload", {}) or {}
+        contexts.append({
+            "path": payload.get("path", ""),
+            "chunk_index": payload.get("chunk_index"),
+            "document": payload.get("text", "")
+        })
+
     return contexts
+
 
 
 def call_chat_robust(system: SystemMessage, user: HumanMessage) -> str:
