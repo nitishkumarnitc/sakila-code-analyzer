@@ -194,6 +194,13 @@ This performs:
 
 ---
 
+
+## ✔ Run Unit test /
+
+```bash
+ docker compose run --rm app python -m pytest -v
+```
+
 ## ✔ Development / Fast Mode (No API Calls)
 
 ```bash

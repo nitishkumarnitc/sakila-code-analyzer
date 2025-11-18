@@ -10,3 +10,4 @@ uvicorn
 langchain-openai
 langchain_core
 lizard
+pytest
