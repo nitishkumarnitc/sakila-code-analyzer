@@ -149,11 +149,23 @@ def _cache_path_for_hash(h: str) -> str:
 def load_vector_from_cache(h: str):
     p = _cache_path_for_hash(h)
     if not os.path.exists(p):
+        logger.debug("[embed-cache] miss %s", h)
         return None
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            vec = json.load(f)
+        # small sanity check
+        if not isinstance(vec, (list, tuple)):
+            logger.warning("[embed-cache] corrupted entry (not list) %s -> removed", p)
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+            return None
+        logger.debug("[embed-cache] hit %s (len=%d) -> %s", h, len(vec), p)
+        return vec
+    except Exception as e:
+        logger.warning("[embed-cache] read failed for %s: %s — removing corrupted cache", p, e)
         try:
             os.remove(p)
         except Exception:
@@ -168,12 +180,15 @@ def save_vector_to_cache(h: str, vec):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(vec, f)
         os.replace(tmp, p)
-    except Exception:
+        logger.debug("[embed-cache] saved %s (len=%d) -> %s", h, len(vec), p)
+    except Exception as e:
+        logger.warning("[embed-cache] failed to persist cache %s: %s", p, e)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
+
 
 
 # ------------------------
